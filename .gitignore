@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+runs/
+*.pt
+*.lnk
+data/
+.audit/
+
+# reference material, never pushed
+netaug/
