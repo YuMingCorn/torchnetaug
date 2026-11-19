@@ -11,13 +11,13 @@ This report answers four questions. It also records the verification method, the
 1. **Does NetAug have depth augmentation?** The paper, the official code (MIT HAN Lab), and the reference implementation `netaug/` augment only width. The reference implementation has a `max_depth` parameter, but nothing uses it. This package adds depth augmentation (`NetAugModel(..., depth={...})`). It follows the elastic depth of Once-for-All, from the same research group.
 2. **Can you build a network directly from Dynamic modules?** Yes. You can set the widths by hand, and the output is exactly the same as a plain network. But then you must handle the width and channel sorting of every layer yourself. The recommended way is to compose the network from ordinary `torch.nn` layers in the usual PyTorch way, and then pass it to `NetAugModel`. The channel analysis then handles width switching, channel sorting, and export automatically, for any kind of model. A model that contains dynamic layers is now rejected explicitly.
 3. **Can the exported model be converted to ONNX?** Yes. The exported models at base, ×2, and random widths convert with both the dynamo and the TorchScript exporters. The onnxruntime output matches PyTorch.
-4. **How well does it work?** RESULTS_SUMMARY
+4. **How well does it work?** With CIFAR-10, TinyResNet, 40 epochs, and 3 seeds, the effect on the base model is small and not significant: width augmentation +0.15 ± 0.74, with sorting +0.34 ± 0.44, depth augmentation −0.05 ± 0.29, and width + depth +0.04 ± 0.34 percentage points. Train accuracy rises in every setting, which matches the "reduce underfitting" mechanism, but this does not turn into test accuracy. The wider networks exported from the NetAug model are worse than networks of the same width trained alone. Every exported model has an output difference of 0 from the dynamic network (Sections 3 and 5).
 
 ## 1. Environment
 
 | Item | Version |
 |---|---|
-| Code | Branch `feat/torchnetaug` (commit `941b37a` when the experiments started; the depth experiments ran on the commit of this report) |
+| Code | Branch `feat/torchnetaug` (commit `941b37a` when the experiments started; commit `83e5073` for the depth experiments) |
 | Python | 3.14.3 |
 | PyTorch | 2.11.0+cu128 (all tests also ran on the 2.15.0 CPU build) |
 | ONNX | onnx 1.23.2, onnxscript 0.7.2, onnxruntime 1.32.0 |
@@ -122,7 +122,26 @@ For the detailed design, see [Section 7 of architecture.en.md](architecture.en.m
 
 One extra block is added after the last block of each stage of TinyResNet (`--depth 1`). The training setup is the same as in Section 3.
 
-DEPTH_RESULTS
+| Method | Test acc (%) | Train acc (%) | Per-seed paired difference from baseline (percentage points) | Mean ± std |
+|---|---|---|---|---|
+| baseline | 86.92 ± 0.35 | 91.90 ± 0.23 | — | — |
+| Depth augmentation (+1 block per stage) | 86.87 ± 0.20 | 92.28 ± 0.16 | s0 +0.05, s1 +0.17, s2 −0.38 | −0.05 ± 0.29 |
+| Width + depth augmentation | 86.96 ± 0.05 | 92.77 ± 0.21 | s0 +0.32, s1 +0.14, s2 −0.33 | +0.04 ± 0.34 |
+| (Reference) width augmentation only | 87.07 ± 0.39 | 92.70 ± 0.20 | s0 +0.83, s1 +0.27, s2 −0.64 | +0.15 ± 0.74 |
+
+| Exported network | Parameters | Test acc (%) |
+|---|---|---|
+| Depth augmentation: base width, every extra block on | 274,802 | 86.92 ± 0.17 |
+| Width + depth augmentation: base width, every extra block on | 274,802 | 87.01 ± 0.17 |
+| Depth augmentation: depth combinations sampled in training (9) | 176,402–274,802 | 86.89 ± 0.19 |
+| Width + depth augmentation: width and depth combinations sampled in training (9) | 537,442–1,880,594 | 87.85 ± 0.24 |
+
+Every exported network has an output difference of 0 from the dynamic network.
+
+- **Depth augmentation has no measurable effect on the base model.** In both settings, the mean paired difference is within ±0.05 percentage points, far smaller than the variation between seeds. Adding depth also does not make width augmentation better (+0.04 vs. +0.15; this difference is also within the noise).
+- **Train accuracy still rises**: by 0.18–0.64 percentage points per seed with depth only, and by 0.58–1.24 with width + depth. As with width augmentation, the gain on the training set does not turn into test accuracy.
+- **The extra blocks learn almost nothing.** With every extra block on, the network has 56% more parameters (274,802 vs. 176,402), but the same accuracy as base (86.92 vs. 86.87). The extra blocks are residual copies whose last BN starts at 0, and they get gradients only when they are sampled. So after 40 epochs they are still close to the identity function.
+- Each run takes about 4.6–5.4 minutes, close to width augmentation.
 
 ## 6. Composing your own network and Dynamic modules
 

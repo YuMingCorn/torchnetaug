@@ -468,7 +468,15 @@ CIFAR-10, TinyResNet (176,402 parameters), 40 epochs, 3 seeds (0, 1, 2) per conf
 - Sorting never moved a channel into the base (a result of the initialization scale, see section 4 of the report), so `+sort10` has no effect on the base model.
 - Every exported model has an output difference of 0 from the dynamic network.
 
-DEPTH_README_EN
+**Depth augmentation** (1 extra block after the last block of each stage, `--depth 1`)
+
+| Method | Test acc (%) | Train acc (%) | Paired difference vs. baseline (points) |
+|---|---|---|---|
+| Depth augmentation | 86.87 ± 0.20 | 92.28 ± 0.16 | −0.05 ± 0.29 |
+| Width + depth augmentation | 86.96 ± 0.05 | 92.77 ± 0.21 | +0.04 ± 0.34 |
+
+- Depth augmentation has no measurable effect on the base model, and adding depth does not make width augmentation better.
+- The exported network with every extra block on (274,802 parameters) reaches 86.92 ± 0.17, the same as base: the extra blocks are residual copies that start as the identity function and train only when sampled, so they learn almost nothing in 40 epochs.
 
 ## Citation and references
 
