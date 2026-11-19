@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torchvision
 
-from torchnetaug import DynamicBatchNorm, NetAugModel, netaug_step, recalibrate_bn
+from torchnetaug import DynamicBatchNorm, DynamicConv2d, DynamicLinear, NetAugModel, netaug_step, recalibrate_bn
 
 from conftest import assert_sorted, build, example_input, randomize
 
@@ -197,6 +197,66 @@ def test_netaug_step_gradients():
         netaug_step(aug, x, target, crit, generator=rng)
     assert conv.weight.grad[16:].abs().sum() > 0
     assert aug.mode == "base"
+
+
+def _pull_back(layer, attr, grad):
+    """Place the gradient of a plain layer's tensor at the entries of the dynamic layer's
+    full tensor that the current width uses (the adjoint of the forward slicing)."""
+    p = getattr(layer, attr)
+    with torch.enable_grad():
+        if isinstance(layer, (DynamicConv2d, DynamicLinear)):
+            sliced = layer.active_weight() if attr == "weight" else layer.active_bias()
+        else:  # batch norm
+            sliced = layer._select_in(p, 0)
+        (full,) = torch.autograd.grad(sliced, p, grad_outputs=grad)
+    return full
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_netaug_step_gradient_is_paper_eq2(model_name, seed):
+    """One ``netaug_step`` accumulates exactly dL(base)/dW + alpha * dL(aug)/dW (paper Eq. 2).
+
+    The reference uses two independent plain models: ``export()`` (base) and
+    ``export(sizes)`` (the sampled augmented network). Each one's gradients are placed
+    back into the shared max-width tensors and summed.
+    """
+    _, aug, x = wrap(model_name)
+    randomize(aug, seed=3 + seed)  # extra channels get non-default values too
+    aug.train()
+    alpha = 0.7
+    n_classes = aug(x).shape[1]
+    target = torch.randint(0, n_classes, (x.shape[0],), generator=torch.Generator().manual_seed(seed))
+    crit = nn.CrossEntropyLoss()
+
+    aug.set_random(random.Random(seed))  # the same draw netaug_step makes below
+    sizes = list(aug.active_sizes)
+    aug.set_base()
+    assert sizes != aug.base_sizes  # the test must exercise widening
+    plain_base, plain_aug = aug.export().train(), aug.export(sizes).train()
+
+    aug.zero_grad()
+    torch.manual_seed(0)  # same dropout / stochastic-depth draws for both computations
+    netaug_step(aug, x, target, crit, alpha=alpha, generator=random.Random(seed))
+    torch.manual_seed(0)
+    crit(plain_base(x), target).backward()
+    (alpha * crit(plain_aug(x), target)).backward()
+
+    expected = {n: torch.zeros_like(p) for n, p in aug.model.named_parameters()}
+    for state, plain in ((aug.base_sizes, plain_base), (sizes, plain_aug)):
+        aug.set_sizes(state)
+        dynamic = dict(aug.dynamic_layers())
+        for n, p in plain.named_parameters():
+            if p.grad is None:
+                continue
+            owner, _, attr = n.rpartition(".")
+            if owner in dynamic:
+                expected[n] += _pull_back(dynamic[owner], attr, p.grad)
+            else:
+                expected[n] += p.grad
+    aug.set_base()
+    for n, p in aug.model.named_parameters():
+        got = torch.zeros_like(p) if p.grad is None else p.grad
+        torch.testing.assert_close(got, expected[n], atol=ATOL, rtol=1e-7, msg=n)
 
 
 def test_recalibrate_bn_matches_exported_model():

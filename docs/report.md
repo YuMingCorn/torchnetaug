@@ -25,11 +25,11 @@
 
 ## 2. 正確性驗證
 
-`uv run pytest` 共 436 個測試，全部通過。測試在 float64 下以很緊的容差比對，而且先把所有參數與 BN 統計值隨機化，避免預設值掩蓋錯誤。
+`uv run pytest` 共 460 個測試，全部通過。測試在 float64 下以很緊的容差比對，而且先把所有參數與 BN 統計值隨機化，避免預設值掩蓋錯誤。
 
 | 測試檔 | 數量 | 驗證的事 |
 |---|---|---|
-| `test_correctness.py` | 80 | base 模式等於原始模型、匯出、排序保持最大寬度函數、排序後有序且冪等、optimizer 狀態重排、BN 不被增強網路污染、梯度 |
+| `test_correctness.py` | 104 | base 模式等於原始模型、匯出、排序保持最大寬度函數、排序後有序且冪等、optimizer 狀態重排、BN 不被增強網路污染、梯度（含逐元素等於論文 Eq. 2） |
 | `test_random_architectures.py` | 61 | 60 個隨機產生的架構（殘差、concat、depthwise、SE 等組合）上的同樣性質，含排序後有序且冪等 |
 | `test_whitelist_lemmas.py` | 172 | 排序正確性證明的前提：白名單運算逐通道獨立、動態層的排列引理 |
 | `test_widths.py` | 55 | 每個寬度的參數量、權重形狀與輸出，等於直接用該寬度建立的普通模型 |
@@ -37,6 +37,35 @@
 | `test_onnx.py` | 12 | ONNX 轉換（第 7 節） |
 | `test_dynamic_usage.py` | 8 | 手動使用動態層，以及對含動態層模型的拒絕（第 6 節） |
 | `test_docs.py` | 4 | 文件中的 Python 範例都能執行（中文與英文版） |
+
+### 2.1 證明鏈：「實作正確」是什麼意思
+
+「實作正確」指的是：套件算出的東西，等於論文定義的東西。這拆成五個環節，每一環都和**不經過本套件、直接用普通 PyTorch 建的模型**比對：
+
+```mermaid
+flowchart TD
+    P["論文的定義<br/>L(base) + α·L(aug)，權重共用"]
+    A["① base 模式 = 原始小模型<br/>test_correctness：test_base_mode_equals_original"]
+    B["② 每個寬度 = 同寬度的普通模型<br/>test_widths"]
+    C["③ 一步的梯度 = 論文 Eq. 2<br/>test_netaug_step_gradient_is_paper_eq2"]
+    D["④ 排序不改變最大寬度的函數<br/>test_correctness、test_random_architectures、test_whitelist_lemmas"]
+    E["⑤ 匯出模型 = 動態網路<br/>test_export_equals_base、export(sizes) 測試、ONNX"]
+    P --> A
+    P --> B
+    A --> C
+    B --> C
+    C --> T["optimizer.step() 收到的正是論文的更新量"]
+    D --> T
+    T --> E
+    E --> Z["部署的模型 = 訓練出的 base 模型"]
+```
+
+- ① 和 ② 證明 forward 正確：任何寬度下，輸出都等於直接用那個寬度建立的普通模型。
+- ③ 直接證明梯度正確。測試用兩個獨立的普通模型：`export()`（base）與 `export(sizes)`（同一步抽到的增強網路）。兩者各自算梯度，放回共用權重的對應位置後相加，必須逐元素等於 `netaug_step` 的結果。故意讓 `netaug_step` 忽略 `alpha`，或抽到不同的增強網路時（突變測試），這個測試都會失敗。
+- ④ 證明通道排序只改變「較小寬度保留哪些通道」，不改變最大寬度的網路函數。
+- ⑤ 證明部署時用的普通模型，和訓練時的動態網路輸出相同。
+
+這條鏈證明的是「程式照論文的定義計算」。它**不能**證明 NetAug 一定會提高準確率：那是經驗問題，要用實驗回答（第 3、5 節）。
 
 ## 3. CIFAR-10 寬度增強實驗
 

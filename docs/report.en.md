@@ -25,11 +25,11 @@ This report answers four questions. It also records the verification method, the
 
 ## 2. Correctness verification
 
-`uv run pytest` runs 436 tests, and all pass. The tests compare outputs in float64 with tight tolerances. Before each comparison, they randomize all parameters and BN statistics, so default values cannot hide errors.
+`uv run pytest` runs 460 tests, and all pass. The tests compare outputs in float64 with tight tolerances. Before each comparison, they randomize all parameters and BN statistics, so default values cannot hide errors.
 
 | Test file | Count | What it checks |
 |---|---|---|
-| `test_correctness.py` | 80 | base mode equals the original model; export; sorting keeps the max-width function; order after sorting, and sorting is idempotent; optimizer state reordering; the augmented network does not corrupt BN; gradients |
+| `test_correctness.py` | 104 | base mode equals the original model; export; sorting keeps the max-width function; order after sorting, and sorting is idempotent; optimizer state reordering; the augmented network does not corrupt BN; gradients (including element-wise equality with paper Eq. 2) |
 | `test_random_architectures.py` | 61 | The same properties on 60 randomly generated architectures (combinations of residual, concat, depthwise, SE, and others), including order after sorting and idempotence |
 | `test_whitelist_lemmas.py` | 172 | The assumptions of the sorting correctness proof: whitelisted operations act on each channel independently; the permutation lemma for dynamic layers |
 | `test_widths.py` | 55 | At each width, the parameter count, weight shapes, and output equal a plain model built directly at that width |
@@ -37,6 +37,35 @@ This report answers four questions. It also records the verification method, the
 | `test_onnx.py` | 12 | ONNX conversion (Section 7) |
 | `test_dynamic_usage.py` | 8 | Manual use of dynamic layers, and rejection of models that contain dynamic layers (Section 6) |
 | `test_docs.py` | 4 | Every Python example in the documents runs (Chinese and English versions) |
+
+### 2.1 The chain of evidence: what "the implementation is correct" means
+
+"The implementation is correct" means: what the package computes equals what the paper defines. This splits into five links. Each link is compared with **a model built directly with plain PyTorch, without this package**:
+
+```mermaid
+flowchart TD
+    P["The paper's definition<br/>L(base) + α·L(aug), shared weights"]
+    A["① base mode = the original tiny model<br/>test_correctness: test_base_mode_equals_original"]
+    B["② each width = a plain model of that width<br/>test_widths"]
+    C["③ the gradient of one step = paper Eq. 2<br/>test_netaug_step_gradient_is_paper_eq2"]
+    D["④ sorting keeps the max-width function<br/>test_correctness, test_random_architectures, test_whitelist_lemmas"]
+    E["⑤ exported model = dynamic network<br/>test_export_equals_base, export(sizes) tests, ONNX"]
+    P --> A
+    P --> B
+    A --> C
+    B --> C
+    C --> T["optimizer.step() receives exactly the paper's update"]
+    D --> T
+    T --> E
+    E --> Z["the deployed model = the trained base model"]
+```
+
+- ① and ② prove that the forward pass is correct: at every width, the output equals a plain model built directly at that width.
+- ③ proves directly that the gradient is correct. The test uses two independent plain models: `export()` (base) and `export(sizes)` (the augmented network sampled in the same step). Each one computes its own gradients. The test puts them back at their positions in the shared weights and adds them. The sum must equal the result of `netaug_step` element by element. When `netaug_step` is changed on purpose to ignore `alpha`, or to sample a different augmented network (mutation tests), this test fails.
+- ④ proves that channel sorting changes only which channels the smaller widths keep. It does not change the max-width network function.
+- ⑤ proves that the plain model used for deployment gives the same output as the dynamic network used in training.
+
+This chain proves that the code computes what the paper defines. It does **not** prove that NetAug always improves accuracy: that is an empirical question, and experiments answer it (Sections 3 and 5).
 
 ## 3. CIFAR-10 width augmentation experiment
 

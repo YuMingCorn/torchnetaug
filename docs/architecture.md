@@ -442,7 +442,38 @@ deep.set_base()
 
 base 模式下，只有前段權重有梯度；增強那次 forward 才會讓額外通道得到梯度（測試 `test_netaug_step_gradients`）。
 
+累加後的梯度逐元素等於論文 Eq. 2：`∂L(base)/∂W + alpha × ∂L(aug)/∂W`。測試 `test_netaug_step_gradient_is_paper_eq2` 用兩個獨立的普通模型驗證這一點：`export()`（base）與 `export(sizes)`（同一步抽到的增強網路）各自算梯度，放回共用權重的對應位置後相加，必須等於 `netaug_step` 的結果（float64，8 個模型 × 3 個 seed）。
+
 `recalibrate_bn()` 在 base 模式下把所有 BN 的 running 統計值重設，改用累積平均（`momentum=None`）跑過指定的批次，結束後還原原本的寬度與深度、momentum 和每個模組的訓練旗標（出錯時也會還原）。它會重設整個最大寬度的 BN，所以增強通道的統計值也會被清掉；這不影響 base 模型與匯出結果。例外是在校正的深度下不會執行的額外 block：它們的 BN 不重設，保留原本的統計值。
+
+### 8.1 base 權重收到的梯度是什麼
+
+論文只說明「增強網路提供額外的監督」，沒有推導這份梯度的作用。下面用兩層線性網路寫出它的結構。這是**梯度結構的推導，不是效果的證明**：它說明 NetAug 改了什麼，但不保證測試準確率會變好。
+
+設 base 網路是 `y = V·W·x`，增強網路多了額外通道 `W_i`（第一層的新輸出）與 `V_i`（第二層讀這些新通道的權重）：
+
+```text
+base：       y  = V·W·x
+增強網路：    y' = V·W·x + V_i·W_i·x
+```
+
+用平方誤差 `L = ½‖y − t‖²`，殘差 `r = y − t`、`r' = y' − t = r + V_i·W_i·x`。對 base 權重 `W` 的梯度是：
+
+```text
+g_base = Vᵀ · r  · xᵀ
+g_aug  = Vᵀ · r' · xᵀ = g_base + Vᵀ · (V_i·W_i·x) · xᵀ
+
+NetAug（alpha = 1）：g_base + g_aug = 2·g_base + Vᵀ · (V_i·W_i·x) · xᵀ
+```
+
+這個式子分成兩部分：
+
+1. **`2·g_base`**：base 梯度加倍。對 SGD 來說，這接近把 base 權重的學習率加倍。所以「NetAug 有效」的一部分，可能只是 base 權重走了較大的步。論文的消融實驗沒有排除這一點（Table 7 測了 weight decay、資料增強與 batch size，沒有測學習率）。
+2. **`Vᵀ·(V_i·W_i·x)·xᵀ`**：NetAug 特有的部分。它讓 `W` 配合額外通道的輸出：額外通道已經預測到的部分，`W` 就少學一點。
+
+在非線性網路裡還有一個效應：增強網路中，base 通道下游的層同時讀到額外通道，所以 ReLU 的開關與 BN 的批次統計值都會改變，`g_aug` 不再只是 `g_base` 加一項。交叉熵的情況，在 `y` 附近做一階展開，結構相同。
+
+兩部分的比重可以量測。`examples/cifar_netaug.py --grad-log-every N` 每 N 步記錄 base 權重上 `g_base` 與 `g_aug` 的 cosine 相似度與長度比 `‖g_aug‖ / ‖g_base‖`。cosine 接近 1、長度比接近 1，代表 NetAug 在這個設定下幾乎等於加大學習率；要排除這個解釋，需要「baseline 用 2 倍學習率」的對照組。
 
 ## 9. 與論文、參考實作的差異
 
@@ -450,8 +481,8 @@ base 模式下，只有前段權重有梯度；增強那次 forward 才會讓額
 |---|---|---|---|
 | 適用模型 | 手寫的 MobileNet 系列 | 手寫的 YOLOv8 模組 | 任何可被 `torch.fx` 追蹤的模型（自動分析） |
 | 增強維度 | 寬度 + expand ratio | 只有寬度（`max_depth` 未使用） | 每個通道群組的寬度（expand ratio 是其中一種群組），以及選用的深度（第 7 節） |
-| 寬度取樣 | 每個 stage 一次 | 每層各自 | 每個群組一次，或整體一次 |
-| 排序 | 同一排列套到相連層 | 只排輸出，殘差兩邊各排 | 一個群組一個排列，套到所有相連張量與 optimizer 狀態 |
+| 寬度取樣 | 每個 stage 的第一個 block 與 stem、head 各自抽寬度（殘差 block 沿用）；expand 每個 block 各自抽 | 每層各自 | 每個群組一次，或整體一次 |
+| 排序 | 只排 inverted block 的中間通道，同一排列套到相連層 | 只排輸出，殘差兩邊各排 | 一個群組一個排列，套到所有相連張量與 optimizer 狀態 |
 | 增強時的 BN | 會更新統計值，評估前重設 | 會更新，可選重設 | 預設不更新，另提供 `recalibrate_bn` |
 | 匯出 | 手寫 `export()` | 手寫 `export_module()` | 回傳原始類別的副本 |
 

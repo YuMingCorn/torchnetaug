@@ -442,7 +442,38 @@ When you build your own network, use only plain layers. `NetAugModel` creates th
 
 In base mode, only the leading weights get gradients. Only the augmented forward pass gives gradients to the extra channels (test `test_netaug_step_gradients`).
 
+The accumulated gradient equals the paper's Eq. 2 element by element: `∂L(base)/∂W + alpha × ∂L(aug)/∂W`. The test `test_netaug_step_gradient_is_paper_eq2` checks this with two independent plain models: `export()` (base) and `export(sizes)` (the augmented network sampled in the same step). Each one computes its own gradients. The test puts them back at their positions in the shared weights and adds them. The sum must equal the result of `netaug_step` (float64, 8 models × 3 seeds).
+
 `recalibrate_bn()` resets the running statistics of all BN layers in base mode. Then it runs the given batches with a cumulative average (`momentum=None`). At the end, it restores the original width and depth, the momentum, and the training flag of every module (also when an error occurs). It resets the full max-width BN, so it also clears the statistics of the augmented channels. This does not affect the base model or the export result. The exception is an extra block that does not run at the calibrated depth: its BN is not reset and keeps its statistics.
+
+### 8.1 What gradient the base weights receive
+
+The paper says only that the augmented network gives "extra supervision". It does not derive what this gradient does. Below, a two-layer linear network shows its structure. This is **a derivation of the gradient's structure, not a proof of its effect**: it shows what NetAug changes, but it does not guarantee a higher test accuracy.
+
+Let the base network be `y = V·W·x`. The augmented network adds extra channels `W_i` (new outputs of the first layer) and `V_i` (the second-layer weights that read these new channels):
+
+```text
+base:               y  = V·W·x
+augmented network:  y' = V·W·x + V_i·W_i·x
+```
+
+With squared error `L = ½‖y − t‖²`, the residuals are `r = y − t` and `r' = y' − t = r + V_i·W_i·x`. The gradients with respect to the base weights `W` are:
+
+```text
+g_base = Vᵀ · r  · xᵀ
+g_aug  = Vᵀ · r' · xᵀ = g_base + Vᵀ · (V_i·W_i·x) · xᵀ
+
+NetAug (alpha = 1): g_base + g_aug = 2·g_base + Vᵀ · (V_i·W_i·x) · xᵀ
+```
+
+The expression has two parts:
+
+1. **`2·g_base`**: the base gradient doubled. For SGD, this is close to doubling the learning rate of the base weights. So part of "NetAug works" may only be a larger step for the base weights. The paper's ablations do not rule this out (Table 7 tests weight decay, data augmentation, and batch size, but not the learning rate).
+2. **`Vᵀ·(V_i·W_i·x)·xᵀ`**: the part that is specific to NetAug. It makes `W` work together with the extra channels: what the extra channels already predict, `W` learns less of.
+
+A non-linear network has one more effect. In the augmented network, the layers downstream of the base channels also read the extra channels. So the ReLU on/off pattern and the BN batch statistics change, and `g_aug` is no longer `g_base` plus one term. For cross-entropy, a first-order expansion around `y` gives the same structure.
+
+The weight of the two parts can be measured. `examples/cifar_netaug.py --grad-log-every N` records, every N steps, the cosine similarity of `g_base` and `g_aug` on the base weights and the norm ratio `‖g_aug‖ / ‖g_base‖`. A cosine near 1 and a ratio near 1 mean that, in this setting, NetAug is almost the same as a larger learning rate. To rule out this explanation, a control group is needed: the baseline with twice the learning rate.
 
 ## 9. Differences from the paper and the reference implementation
 
@@ -450,8 +481,8 @@ In base mode, only the leading weights get gradients. Only the augmented forward
 |---|---|---|---|
 | Supported models | Hand-written MobileNet family | Hand-written YOLOv8 modules | Any model that `torch.fx` can trace (automatic analysis) |
 | Augmented dimensions | Width + expand ratio | Width only (`max_depth` is unused) | The width of each channel group (expand ratio is one kind of group), and optional depth (Section 7) |
-| Width sampling | Once per stage | Each layer separately | Once per group, or once for the whole model |
-| Sorting | The same permutation applied to connected layers | Outputs only; the two residual sides are sorted separately | One permutation per group, applied to all connected tensors and the optimizer state |
+| Width sampling | The first block of each stage, the stem, and the head each sample a width (residual blocks follow); each block samples its expand ratio | Each layer separately | Once per group, or once for the whole model |
+| Sorting | Only the middle channels of inverted blocks; the same permutation applied to connected layers | Outputs only; the two residual sides are sorted separately | One permutation per group, applied to all connected tensors and the optimizer state |
 | BN during augmentation | Updates statistics; resets them before evaluation | Updates; optional reset | No update by default; `recalibrate_bn` is provided separately |
 | Export | Hand-written `export()` | Hand-written `export_module()` | Returns a copy of the original class |
 
