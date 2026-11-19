@@ -339,6 +339,11 @@ def test_module_conversions_work():
     netaug.to(torch.float64)
     assert all(p.dtype == torch.float64 for p in netaug.parameters())
     assert netaug.state() == saved
+    for dtype in (torch.float32, torch.float64):  # export keeps the converted dtype
+        netaug.to(dtype)
+        for exported in (netaug.export(), netaug.export(netaug.max_sizes, netaug.max_depths)):
+            assert {p.dtype for p in exported.parameters()} == {dtype}
+            assert all(p.requires_grad and p.is_leaf for p in exported.parameters())
     if torch.cuda.is_available():
         netaug.cuda()
         assert all(p.is_cuda for p in netaug.parameters())

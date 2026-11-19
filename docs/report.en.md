@@ -91,9 +91,9 @@ The experiments record two things at each sort.
 - **Change in the max-width output**: over 9 sorts (3 seeds × epochs 10, 20, 30), the maximum is 8.6e-6, while the absolute values of the logits are about 20 to 31. This is error from the float32 summation order. It shows that sorting also keeps the function unchanged on weights from real training.
 - **Number of channels moved into base**: 0 in all 9 sorts. So sorting never changed the channels that the base model uses.
 
-The reason is structural. When the model is widened, the weights of the new channels get the default initialization. The PyTorch default initialization scales with the number of input channels. At max width, a layer has 3 times the original input channels, so the new weights have a smaller standard deviation (for example, in `layers.0.conv1` it is about 0.070 for the base block and about 0.039 for the new block). Before training, in every group, the smallest importance of a base channel is already 1.08 to 1.19 times the largest importance of a new channel (3 seeds). During training, the base channels get gradients at every step, but the new channels get gradients only when they are sampled. So the gap stays.
+The reason is structural. When the model is widened, the weights of the new channels get the default initialization. The PyTorch default initialization scales with the number of input channels. At max width, a layer has 3 times the original input channels, so the new weights have a smaller standard deviation (for example, in `layers.0.conv1` it is about 0.070 for the base block and about 0.039 for the new block). Before training, in every group, the smallest importance of a base channel is already 1.06 to 1.19 times the largest importance of a new channel (float32, as in the experiment, 3 seeds). During training, the base channels get gradients at every step, but the new channels get gradients only when they are sampled. So the gap stays.
 
-So in this setting, sorting changes only which channels the middle widths (for example ×2) keep: before training, 173 to 180 of the 720 channels that the ×2 width keeps are replaced (3 seeds). It has no effect on the base model. The difference in base accuracy between `+sort10` and `netaug` is seed noise, not an effect of sorting.
+So in this setting, sorting changes only which channels the middle widths (for example ×2) keep: before training, 168 to 188 of the 720 channels that the ×2 width keeps are replaced (float32, 3 seeds). It has no effect on the base model. The difference in base accuracy between `+sort10` and `netaug` is seed noise, not an effect of sorting.
 
 ## 5. Depth augmentation
 
@@ -138,10 +138,10 @@ One extra block is added after the last block of each stage of TinyResNet (`--de
 
 Every exported network has an output difference of 0 from the dynamic network.
 
-- **Depth augmentation has no measurable effect on the base model.** In both settings, the mean paired difference is within ±0.05 percentage points, far smaller than the variation between seeds. Adding depth also does not make width augmentation better (+0.04 vs. +0.15; this difference is also within the noise).
+- **Depth augmentation has no measurable effect on the base model.** The mean paired differences of the two settings are −0.05 and +0.04 percentage points, far smaller than the variation between seeds. Adding depth also does not make width augmentation better (+0.04 vs. +0.15; this difference is also within the noise).
 - **Train accuracy still rises**: by 0.18–0.64 percentage points per seed with depth only, and by 0.58–1.24 with width + depth. As with width augmentation, the gain on the training set does not turn into test accuracy.
 - **The extra blocks learn almost nothing.** With every extra block on, the network has 56% more parameters (274,802 vs. 176,402), but the same accuracy as base (86.92 vs. 86.87). The extra blocks are residual copies whose last BN starts at 0, and they get gradients only when they are sampled. So after 40 epochs they are still close to the identity function.
-- Each run takes about 4.6–5.4 minutes, close to width augmentation.
+- Each run takes about 4.6–5.4 minutes. During some runs, the GPU was also running other programs, so the times of different methods cannot be compared directly.
 
 ## 6. Composing your own network and Dynamic modules
 
@@ -183,6 +183,7 @@ Another approach is to provide the package's own composition modules (for exampl
 | `depth=` and `recalibrate_bn` restored only the train/eval flag of the root module | Frozen (eval) submodules were switched to training mode | Save and restore the flag of each module; `test_depth_keeps_per_module_train_flags` |
 | `recalibrate_bn` did not restore the state when an error occurred during switching; base calibration cleared the BN statistics of extra blocks that did not run | The width and depth state was lost; with `update_bn_in_aug=True`, the statistics of the extra blocks were cleared | Switching moved into `try`; extra blocks that do not run are not reset; `test_recalibrate_bn_restores_state_and_flags_on_error` |
 | `NetAugModel._apply` overrode `nn.Module._apply` | `.to()`, `.cuda()`, `.float()`, and similar calls all failed | Renamed to `_apply_state`; `test_module_conversions_work` |
+| After `.double()` or `.half()`, the base `export()` fell back to float32 | The exported weights were silently rounded to float32 | `load_state_dict(..., assign=True)`; `test_module_conversions_work` |
 | Frozen BN inside a depth point block was switched back to training mode | The running statistics of the frozen BN were updated | `DepthStack` sets only its own flag; `make_extra` restores the flag of each module |
 | The depth augmentation prototype used hand-written switches | The experiment results could not represent the package behavior | Changed to the package API (`depth=`); the experiment script is now `examples/cifar_netaug.py --depth` |
 

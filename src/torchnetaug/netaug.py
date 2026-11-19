@@ -427,7 +427,7 @@ class NetAugModel(nn.Module):
             for k, v in state.items():
                 k = self._template_name(k)
                 if k is not None:
-                    cloned[k] = v.clone()
+                    cloned[k] = v.detach().clone()
             # keep the per-module version info: some modules (e.g. MnasNet) require it
             meta = getattr(state, "_metadata", None)
             if meta is not None:
@@ -436,7 +436,7 @@ class NetAugModel(nn.Module):
                     if not k or self._template_name(k) is not None
                 )
             cloned._metadata = meta  # type: ignore[attr-defined]
-            out.load_state_dict(cloned)
+            out.load_state_dict(cloned, assign=True)  # keep the model's dtype (e.g. after .double())
         p = next(self.model.parameters(), None)
         if p is not None:
             out.to(p.device)
