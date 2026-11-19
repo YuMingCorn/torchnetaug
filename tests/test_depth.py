@@ -348,3 +348,23 @@ def test_module_conversions_work():
         netaug.cuda()
         assert all(p.is_cuda for p in netaug.parameters())
         netaug.cpu()
+
+
+def test_export_keeps_dtype_of_non_persistent_buffers():
+    class WithBuffer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = nn.Conv2d(3, 8, 3, padding=1)
+            self.fc = nn.Linear(8, 4)
+            self.register_buffer("proj", torch.randn(4, 4), persistent=False)
+
+        def forward(self, x):
+            return self.fc(self.conv(x).mean((2, 3))) @ self.proj
+
+    x = _x().float()
+    netaug = NetAugModel(WithBuffer().float(), x).double().eval()
+    for exported in (netaug.export(), netaug.export(netaug.max_sizes)):
+        assert {t.dtype for t in list(exported.parameters()) + list(exported.buffers())} == {torch.float64}
+        with torch.no_grad():
+            exported.eval()(x.double())
+    torch.testing.assert_close(netaug.export().eval()(x.double()), netaug(x.double()), rtol=0, atol=0)

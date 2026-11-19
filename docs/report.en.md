@@ -25,7 +25,7 @@ This report answers four questions. It also records the verification method, the
 
 ## 2. Correctness verification
 
-`uv run pytest` runs 434 tests, and all pass. The tests compare outputs in float64 with tight tolerances. Before each comparison, they randomize all parameters and BN statistics, so default values cannot hide errors.
+`uv run pytest` runs 435 tests, and all pass. The tests compare outputs in float64 with tight tolerances. Before each comparison, they randomize all parameters and BN statistics, so default values cannot hide errors.
 
 | Test file | Count | What it checks |
 |---|---|---|
@@ -33,7 +33,7 @@ This report answers four questions. It also records the verification method, the
 | `test_random_architectures.py` | 61 | The same properties on 60 randomly generated architectures (combinations of residual, concat, depthwise, SE, and others), including order after sorting and idempotence |
 | `test_whitelist_lemmas.py` | 172 | The assumptions of the sorting correctness proof: whitelisted operations act on each channel independently; the permutation lemma for dynamic layers |
 | `test_widths.py` | 55 | At each width, the parameter count, weight shapes, and output equal a plain model built directly at that width |
-| `test_depth.py` | 42 | Depth augmentation (Section 5) |
+| `test_depth.py` | 43 | Depth augmentation (Section 5) |
 | `test_onnx.py` | 12 | ONNX conversion (Section 7) |
 | `test_dynamic_usage.py` | 8 | Manual use of dynamic layers, and rejection of models that contain dynamic layers (Section 6) |
 | `test_docs.py` | 4 | Every Python example in the documents runs (Chinese and English versions) |
@@ -183,7 +183,7 @@ Another approach is to provide the package's own composition modules (for exampl
 | `depth=` and `recalibrate_bn` restored only the train/eval flag of the root module | Frozen (eval) submodules were switched to training mode | Save and restore the flag of each module; `test_depth_keeps_per_module_train_flags` |
 | `recalibrate_bn` did not restore the state when an error occurred during switching; base calibration cleared the BN statistics of extra blocks that did not run | The width and depth state was lost; with `update_bn_in_aug=True`, the statistics of the extra blocks were cleared | Switching moved into `try`; extra blocks that do not run are not reset; `test_recalibrate_bn_restores_state_and_flags_on_error` |
 | `NetAugModel._apply` overrode `nn.Module._apply` | `.to()`, `.cuda()`, `.float()`, and similar calls all failed | Renamed to `_apply_state`; `test_module_conversions_work` |
-| After `.double()` or `.half()`, the base `export()` fell back to float32 | The exported weights were silently rounded to float32 | `load_state_dict(..., assign=True)`; `test_module_conversions_work` |
+| After `.double()` or `.half()`, the base `export()` fell back to float32 | The exported weights were silently rounded to float32 | `load_state_dict(..., assign=True)`, and buffers outside the state_dict also follow the model; `test_module_conversions_work`, `test_export_keeps_dtype_of_non_persistent_buffers` |
 | Frozen BN inside a depth point block was switched back to training mode | The running statistics of the frozen BN were updated | `DepthStack` sets only its own flag; `make_extra` restores the flag of each module |
 | The depth augmentation prototype used hand-written switches | The experiment results could not represent the package behavior | Changed to the package API (`depth=`); the experiment script is now `examples/cifar_netaug.py --depth` |
 

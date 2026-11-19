@@ -25,7 +25,7 @@
 
 ## 2. 正確性驗證
 
-`uv run pytest` 共 434 個測試，全部通過。測試在 float64 下以很緊的容差比對，而且先把所有參數與 BN 統計值隨機化，避免預設值掩蓋錯誤。
+`uv run pytest` 共 435 個測試，全部通過。測試在 float64 下以很緊的容差比對，而且先把所有參數與 BN 統計值隨機化，避免預設值掩蓋錯誤。
 
 | 測試檔 | 數量 | 驗證的事 |
 |---|---|---|
@@ -33,7 +33,7 @@
 | `test_random_architectures.py` | 61 | 60 個隨機產生的架構（殘差、concat、depthwise、SE 等組合）上的同樣性質，含排序後有序且冪等 |
 | `test_whitelist_lemmas.py` | 172 | 排序正確性證明的前提：白名單運算逐通道獨立、動態層的排列引理 |
 | `test_widths.py` | 55 | 每個寬度的參數量、權重形狀與輸出，等於直接用該寬度建立的普通模型 |
-| `test_depth.py` | 42 | 深度增強（第 5 節） |
+| `test_depth.py` | 43 | 深度增強（第 5 節） |
 | `test_onnx.py` | 12 | ONNX 轉換（第 7 節） |
 | `test_dynamic_usage.py` | 8 | 手動使用動態層，以及對含動態層模型的拒絕（第 6 節） |
 | `test_docs.py` | 4 | 文件中的 Python 範例都能執行（中文與英文版） |
@@ -183,7 +183,7 @@
 | `depth=` 與 `recalibrate_bn` 只還原根模組的 train/eval 狀態 | 凍結（eval）的子模組被改成訓練模式 | 逐模組保存並還原；`test_depth_keeps_per_module_train_flags` |
 | `recalibrate_bn` 在切換狀態時出錯不會還原；base 校正會清掉未執行的額外 block 的 BN 統計值 | 寬度與深度狀態遺失；`update_bn_in_aug=True` 時額外 block 的統計值被清除 | 切換移入 `try`；未執行的額外 block 不重設；`test_recalibrate_bn_restores_state_and_flags_on_error` |
 | `NetAugModel._apply` 覆寫了 `nn.Module._apply` | `.to()`、`.cuda()`、`.float()` 等全部失敗 | 改名為 `_apply_state`；`test_module_conversions_work` |
-| 模型轉成 `.double()` 或 `.half()` 後，base `export()` 回到 float32 | 匯出的權重被靜默捨入成 float32 | `load_state_dict(..., assign=True)`；`test_module_conversions_work` |
+| 模型轉成 `.double()` 或 `.half()` 後，base `export()` 回到 float32 | 匯出的權重被靜默捨入成 float32 | `load_state_dict(..., assign=True)`，不在 state_dict 的 buffer 也跟隨模型；`test_module_conversions_work`、`test_export_keeps_dtype_of_non_persistent_buffers` |
 | 深度增強點 block 內被凍結的 BN 變回訓練模式 | 凍結 BN 的 running 統計值會被更新 | `DepthStack` 只設定自己的旗標；`make_extra` 逐模組還原 |
 | 深度增強的原型以手寫開關實作 | 實驗結果無法代表套件行為 | 改為套件 API（`depth=`），實驗腳本改用 `examples/cifar_netaug.py --depth` |
 
