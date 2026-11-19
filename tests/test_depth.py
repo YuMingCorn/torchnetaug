@@ -302,12 +302,13 @@ def test_bare_layer_as_depth_point_exports():
 def test_depth_keeps_per_module_train_flags():
     """Frozen (eval-mode) submodules stay frozen when depth= is used, as without it."""
     model = TinyResNet(BASE_WIDTHS).train()
-    frozen = ["layers.0.bn1", "layers.2.bn2"]
+    frozen = ["layers.0.bn1", "layers.1.bn1", "layers.2.bn2"]  # layers.1 is the depth point
     for name in frozen:
         model.get_submodule(name).eval()
     netaug = NetAugModel(model, _x(), depth={"layers.1": 1})
-    for name in frozen:
+    for name in ["layers.0.bn1", "layers.1.block.bn1", "layers.1.extra.0.bn1", "layers.2.bn2"]:
         assert not netaug.model.get_submodule(name).training, name
+    assert netaug.model.get_submodule("layers.1.block.bn2").training
     assert netaug.model.get_submodule("layers.3").training
 
 
@@ -326,3 +327,19 @@ def test_recalibrate_bn_restores_state_and_flags_on_error():
     recalibrate_bn(netaug, [_x()])
     assert netaug.state() == saved
     assert not bn.training and netaug.model.get_submodule("layers.1").training
+
+
+def test_module_conversions_work():
+    """NetAugModel must not shadow nn.Module._apply: .to(), .float(), .double() keep working."""
+    _, netaug = _make("tiny_resnet")
+    netaug.set_depths({"layers.5": 1})
+    saved = netaug.state()
+    netaug.float()
+    assert all(p.dtype == torch.float32 for p in netaug.parameters())
+    netaug.to(torch.float64)
+    assert all(p.dtype == torch.float64 for p in netaug.parameters())
+    assert netaug.state() == saved
+    if torch.cuda.is_available():
+        netaug.cuda()
+        assert all(p.is_cuda for p in netaug.parameters())
+        netaug.cpu()

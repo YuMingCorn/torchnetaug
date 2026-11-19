@@ -25,7 +25,7 @@
 
 ## 2. 正確性驗證
 
-`uv run pytest` 共 433 個測試，全部通過。測試在 float64 下以很緊的容差比對，而且先把所有參數與 BN 統計值隨機化，避免預設值掩蓋錯誤。
+`uv run pytest` 共 434 個測試，全部通過。測試在 float64 下以很緊的容差比對，而且先把所有參數與 BN 統計值隨機化，避免預設值掩蓋錯誤。
 
 | 測試檔 | 數量 | 驗證的事 |
 |---|---|---|
@@ -33,7 +33,7 @@
 | `test_random_architectures.py` | 61 | 60 個隨機產生的架構（殘差、concat、depthwise、SE 等組合）上的同樣性質，含排序後有序且冪等 |
 | `test_whitelist_lemmas.py` | 172 | 排序正確性證明的前提：白名單運算逐通道獨立、動態層的排列引理 |
 | `test_widths.py` | 55 | 每個寬度的參數量、權重形狀與輸出，等於直接用該寬度建立的普通模型 |
-| `test_depth.py` | 41 | 深度增強（第 5 節） |
+| `test_depth.py` | 42 | 深度增強（第 5 節） |
 | `test_onnx.py` | 12 | ONNX 轉換（第 7 節） |
 | `test_dynamic_usage.py` | 8 | 手動使用動態層，以及對含動態層模型的拒絕（第 6 節） |
 | `test_docs.py` | 4 | 文件中的 Python 範例都能執行（中文與英文版） |
@@ -61,7 +61,7 @@ WIDTH_DISCUSSION
 
 排序的設計保證：最大寬度的網路函數不變，只改變較小寬度保留哪些通道。
 
-排序後的有序性由 `tests/conftest.py` 的 `assert_sorted` 檢查：每個群組重新計算的重要度必須非遞增（逐位元比較，不設容差），而且立刻再排序一次時，每個群組的排列都必須是恆等排列。這兩點成立的原因是：排列搬移的是整條通道切片，每個通道的重要度由相同的數值、以相同順序加總，排序後得到逐位元相同的遞減序列；`argsort(stable=True)` 對已排序的序列回傳恆等排列。這個檢查套用於 8 個固定模型、60 個隨機架構與 4 個深度增強模型。把排序改成遞增或隨機排列時（突變測試），檢查都會失敗。
+排序後的有序性由 `tests/conftest.py` 的 `assert_sorted` 檢查：每個群組重新計算的重要度必須在捨入誤差內非遞增，而且立刻再排序一次時，只能交換重要度在捨入誤差內相同的通道。重新計算的值不是逐位元相同，因為其他群組的排列會改變讀取者權重的加總順序（float32 實測最大約 1.6e-6 相對誤差）；所以檢查使用相對容差（float64 測試為 1e-9，float32 建議 1e-5）。這個檢查套用於 8 個固定模型、60 個隨機架構與 4 個深度增強模型；float32 的 CPU 與 CUDA 上也另外驗證過。把排序改成遞增或隨機排列時（突變測試），檢查都會失敗。
 
 實驗中每次排序都記錄兩件事。
 
@@ -140,6 +140,8 @@ DEPTH_RESULTS
 | 深度增強點是單一層（不是 block）時，`export(sizes, depths)` 失敗 | 只有 base `export()` 能用 | 名稱對應補上 `P.block`、`P.extra.i` 本身；`test_bare_layer_as_depth_point_exports` |
 | `depth=` 與 `recalibrate_bn` 只還原根模組的 train/eval 狀態 | 凍結（eval）的子模組被改成訓練模式 | 逐模組保存並還原；`test_depth_keeps_per_module_train_flags` |
 | `recalibrate_bn` 在切換狀態時出錯不會還原；base 校正會清掉未執行的額外 block 的 BN 統計值 | 寬度與深度狀態遺失；`update_bn_in_aug=True` 時額外 block 的統計值被清除 | 切換移入 `try`；未執行的額外 block 不重設；`test_recalibrate_bn_restores_state_and_flags_on_error` |
+| `NetAugModel._apply` 覆寫了 `nn.Module._apply` | `.to()`、`.cuda()`、`.float()` 等全部失敗 | 改名為 `_apply_state`；`test_module_conversions_work` |
+| 深度增強點 block 內被凍結的 BN 變回訓練模式 | 凍結 BN 的 running 統計值會被更新 | `DepthStack` 只設定自己的旗標；`make_extra` 逐模組還原 |
 | 深度增強的原型以手寫開關實作 | 實驗結果無法代表套件行為 | 改為套件 API（`depth=`），實驗腳本改用 `examples/cifar_netaug.py --depth` |
 
 ## 9. 限制

@@ -90,10 +90,11 @@ def make_extra(block: nn.Module, example: Optional[torch.Tensor]) -> nn.Module:
             if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.affine][-1]
     last.weight.zero_()
     last.bias.zero_()
-    was_training = candidate.training
+    flags = [(m, m.training) for m in candidate.modules()]  # keep per-module flags
     candidate.eval()
     out: Any = candidate(example)
-    candidate.train(was_training)
+    for m, flag in flags:
+        m.training = flag
     if isinstance(out, torch.Tensor) and out.shape == example.shape and torch.allclose(
         out.float(), example.float(), rtol=1e-5, atol=1e-6
     ):

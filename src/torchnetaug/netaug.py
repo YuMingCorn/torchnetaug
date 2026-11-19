@@ -98,7 +98,7 @@ def _add_depth(work: nn.Module, model: nn.Module, example_inputs: Any, depth: Ma
             )
         block = work.get_submodule(p)
         stack = DepthStack(block, [make_extra(block, out) for _ in range(k)])
-        stack.train(block.training)
+        stack.training = block.training  # only the wrapper: keep the flags inside the block
         _set_submodule(work, p, stack)
     return sorted(paths)
 
@@ -292,9 +292,9 @@ class NetAugModel(nn.Module):
 
     def set_state(self, state: Tuple[Sequence[int], Mapping[str, int], str]) -> None:
         sizes, depths, mode = state
-        self._apply(sizes, depths, mode)
+        self._apply_state(sizes, depths, mode)
 
-    def _apply(self, sizes: Sequence[int], depths: Mapping[str, int], mode: str) -> None:
+    def _apply_state(self, sizes: Sequence[int], depths: Mapping[str, int], mode: str) -> None:
         if len(sizes) != self.graph.num_groups:
             raise ValueError(f"expected {self.graph.num_groups} sizes, got {len(sizes)}")
         for g, s in enumerate(sizes):
@@ -325,20 +325,20 @@ class NetAugModel(nn.Module):
 
     def set_sizes(self, sizes: Sequence[int], mode: str = "custom") -> None:
         """Set the active width of every channel group (one size per group). Depth is kept."""
-        self._apply(sizes, self.active_depths, mode)
+        self._apply_state(sizes, self.active_depths, mode)
 
     def set_depths(self, depths: Mapping[str, int], mode: str = "custom") -> None:
         """Set how many extra blocks run at each depth point (0 = base). Width is kept.
 
         Depth points not in ``depths`` keep their current value.
         """
-        self._apply(self.active_sizes, {**self.active_depths, **depths}, mode)
+        self._apply_state(self.active_sizes, {**self.active_depths, **depths}, mode)
 
     def set_base(self) -> None:
-        self._apply(self.base_sizes, self.base_depths, "base")
+        self._apply_state(self.base_sizes, self.base_depths, "base")
 
     def set_max(self) -> None:
-        self._apply(self.max_sizes, self.max_depths, "max")
+        self._apply_state(self.max_sizes, self.max_depths, "max")
 
     def set_width(self, mult: float) -> None:
         """Scale every free group by the same multiplier (``mode == "custom"``). Depth is kept.
@@ -351,7 +351,7 @@ class NetAugModel(nn.Module):
             for b, mx, fixed in zip(self.base_sizes, self.max_sizes, self.graph.group_fixed)
         ]
         base = sizes == self.base_sizes and self.active_depths == self.base_depths
-        self._apply(sizes, self.active_depths, "base" if base else "custom")
+        self._apply_state(sizes, self.active_depths, "base" if base else "custom")
 
     def set_random(self, generator: Optional[random.Random] = None, granularity: str = "group") -> None:
         """Sample an augmented model.
@@ -374,7 +374,7 @@ class NetAugModel(nn.Module):
         else:
             raise ValueError("granularity must be 'group' or 'global'")
         depths = {p: rng.randint(0, k) for p, k in self.max_depths.items()}
-        self._apply(sizes, depths, "random")
+        self._apply_state(sizes, depths, "random")
 
     @contextmanager
     def mode_ctx(self, mode: str, **kwargs: Any) -> Iterator["NetAugModel"]:
@@ -470,7 +470,7 @@ class NetAugModel(nn.Module):
 
     def _export_state(self, sizes: Sequence[int], depths: Mapping[str, int]) -> nn.Module:
         previous = self.state()
-        self._apply(sizes, depths, "custom")
+        self._apply_state(sizes, depths, "custom")
         try:
             out = copy.deepcopy(self.model)
             for name, layer in self.dynamic_layers():
