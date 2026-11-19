@@ -405,3 +405,8 @@ def test_export_converts_every_alias_of_a_non_persistent_buffer():
     assert exported.s.t1.dtype == exported.s.f.t2.dtype == torch.float64
     with torch.no_grad():
         torch.testing.assert_close(exported(x.double()), netaug(x.double()), rtol=0, atol=0)
+    # .double() untied the model's aliases; if they diverge, each keeps its own value
+    with torch.no_grad():
+        netaug.model.s.f.t2.add_(5.0)
+        exported = netaug.export().eval()
+        torch.testing.assert_close(exported(x.double()), netaug(x.double()), rtol=0, atol=0)
