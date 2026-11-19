@@ -390,6 +390,7 @@ uv run pytest
 | base 模式輸出等於原始模型 | `test_base_mode_equals_original` |
 | 匯出模型是原始類別，形狀相同，輸出等於 base | `test_export_equals_base` |
 | 排序前後最大寬度輸出不變（殘差、concat、SE 都涵蓋） | `test_sort_keeps_max_function` |
+| 排序後的有序性：每個群組的重要度在捨入誤差內非遞增，再排序一次只交換捨入誤差內同分的通道（固定模型、60 個隨機架構、深度增強模型） | `test_sort_orders_importance`、`assert_sorted` |
 | **任意模組組合**：60 個隨機產生的架構，排序或任意排列後最大寬度輸出不變，base 與匯出也正確 | `test_random_architectures.py` |
 | 只排輸出（參考實作的做法）一定會破壞輸出 | `test_sort_only_outputs_breaks_function` |
 | optimizer 狀態跟著正確重排 | `test_permutation_commutes_with_optimizer_step` |
@@ -431,7 +432,8 @@ uv run python examples/check_widths_fake_data.py
 
 ```bash
 bash examples/run_cifar10_compare.sh            # baseline、NetAug、NetAug + 排序，各 3 個 seed
-uv run python examples/summarize.py runs/cifar10_compare.jsonl
+bash examples/run_cifar10_depth.sh              # 深度增強、寬度 + 深度增強，各 3 個 seed
+uv run python examples/summarize.py runs/cifar10_compare.jsonl runs/cifar10_depth.jsonl
 ```
 
 - 每次執行在 jsonl 檔加一行，記錄 base 模型的測試與訓練準確率。
@@ -439,6 +441,34 @@ uv run python examples/summarize.py runs/cifar10_compare.jsonl
 - 單次執行的差距可能只是雜訊，所以比較 3 個 seed 的平均與標準差。
 
 結果：見下方「實驗結果」。
+
+## 實驗結果
+
+CIFAR-10，TinyResNet（176,402 個參數），40 epochs，每種設定 3 個 seed（0、1、2）。完整設定與討論見 [docs/report.md](docs/report.md)。
+
+**base 寬度（部署的模型）**
+
+| 方法 | test acc (%) | train acc (%) | 與 baseline 的配對差異（百分點） |
+|---|---|---|---|
+| baseline | 86.92 ± 0.35 | 91.90 ± 0.23 | — |
+| netaug | 87.07 ± 0.39 | 92.70 ± 0.20 | +0.15 ± 0.74 |
+| netaug+sort10 | 87.26 ± 0.09 | 92.81 ± 0.23 | +0.34 ± 0.44 |
+
+**各寬度：從 NetAug 模型匯出 vs. 單獨訓練（test acc %）**
+
+| 寬度 | 參數量 | 單獨訓練 | netaug 匯出 | netaug+sort10 匯出 |
+|---|---|---|---|---|
+| ×1.0 | 176,402 | 86.92 ± 0.35 | 87.07 ± 0.39 | 87.26 ± 0.09 |
+| ×1.5 | 395,350 | 89.27 ± 0.11 | 87.48 ± 0.25 | 88.00 ± 0.13 |
+| ×2.0 | 701,466 | 90.46 ± 0.27 | 88.22 ± 0.16 | 88.48 ± 0.21 |
+| ×3.0 | 1,575,202 | 91.62 ± 0.30 | 88.44 ± 0.18 | 88.50 ± 0.27 |
+
+- base 模型的增益很小，小於 seed 之間的差異，3 個 seed 不足以判定有效。每個 seed 的訓練準確率都上升 0.7–1.3 個百分點，符合「緩解欠擬合」的機制。
+- 較寬的匯出模型不如同寬度單獨訓練的模型；NetAug 的目標是 base 模型。
+- 排序從未把通道移入 base（初始化尺度造成，見 report 第 4 節），所以 `+sort10` 對 base 沒有作用。
+- 所有匯出模型與動態網路的輸出差異都是 0。
+
+DEPTH_README_ZH
 
 ## 引用與參考資料
 

@@ -390,6 +390,7 @@ The tests compare outputs in float64 with tight tolerances. They first randomize
 | Base-mode output equals the original model | `test_base_mode_equals_original` |
 | The exported model is the original class, has the same shapes, and its output equals the base | `test_export_equals_base` |
 | Max-width output does not change after sorting (covers residual, concat and SE) | `test_sort_keeps_max_function` |
+| Order after sorting: each group's importance is non-increasing up to rounding, and sorting again only swaps channels tied up to rounding (fixed models, 60 random architectures, depth-augmented models) | `test_sort_orders_importance`, `assert_sorted` |
 | **Any combination of modules**: on 60 randomly generated architectures, max-width output does not change after sorting or any permutation, and base and export are also correct | `test_random_architectures.py` |
 | Sorting only the outputs (the method of the reference implementation) always breaks the output | `test_sort_only_outputs_breaks_function` |
 | Optimizer state is reordered correctly | `test_permutation_commutes_with_optimizer_step` |
@@ -431,7 +432,8 @@ This only shows that the "size and computation" at each width are correct, and t
 
 ```bash
 bash examples/run_cifar10_compare.sh            # baseline, NetAug, NetAug + sorting; 3 seeds each
-uv run python examples/summarize.py runs/cifar10_compare.jsonl
+bash examples/run_cifar10_depth.sh              # depth augmentation, width + depth augmentation; 3 seeds each
+uv run python examples/summarize.py runs/cifar10_compare.jsonl runs/cifar10_depth.jsonl
 ```
 
 - Each run adds one line to the jsonl file. The line records the test and train accuracy of the base model.
@@ -439,6 +441,34 @@ uv run python examples/summarize.py runs/cifar10_compare.jsonl
 - The gap from a single run can be just noise, so compare the mean and standard deviation over 3 seeds.
 
 Results: see "Experiment results" below.
+
+## Experiment results
+
+CIFAR-10, TinyResNet (176,402 parameters), 40 epochs, 3 seeds (0, 1, 2) per configuration. See [docs/report.en.md](docs/report.en.md) for the full setup and discussion.
+
+**Base width (the deployed model)**
+
+| Method | Test acc (%) | Train acc (%) | Paired difference vs. baseline (points) |
+|---|---|---|---|
+| baseline | 86.92 ± 0.35 | 91.90 ± 0.23 | — |
+| netaug | 87.07 ± 0.39 | 92.70 ± 0.20 | +0.15 ± 0.74 |
+| netaug+sort10 | 87.26 ± 0.09 | 92.81 ± 0.23 | +0.34 ± 0.44 |
+
+**Each width: exported from the NetAug model vs. trained alone (test acc %)**
+
+| Width | Parameters | Trained alone | netaug exported | netaug+sort10 exported |
+|---|---|---|---|---|
+| ×1.0 | 176,402 | 86.92 ± 0.35 | 87.07 ± 0.39 | 87.26 ± 0.09 |
+| ×1.5 | 395,350 | 89.27 ± 0.11 | 87.48 ± 0.25 | 88.00 ± 0.13 |
+| ×2.0 | 701,466 | 90.46 ± 0.27 | 88.22 ± 0.16 | 88.48 ± 0.21 |
+| ×3.0 | 1,575,202 | 91.62 ± 0.30 | 88.44 ± 0.18 | 88.50 ± 0.27 |
+
+- The gain for the base model is small, smaller than the variation between seeds; 3 seeds are not enough to show an effect. Train accuracy rises by 0.7–1.3 points for every seed, which matches the "reduce underfitting" mechanism.
+- Wider exported models are worse than models of the same width trained alone; NetAug targets the base model.
+- Sorting never moved a channel into the base (a result of the initialization scale, see section 4 of the report), so `+sort10` has no effect on the base model.
+- Every exported model has an output difference of 0 from the dynamic network.
+
+DEPTH_README_EN
 
 ## Citation and references
 
