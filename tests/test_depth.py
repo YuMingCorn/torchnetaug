@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torchvision
-from conftest import randomize
+from conftest import assert_sorted, randomize
 from test_widths import BASE_WIDTHS, TinyResNet
 
 from torchnetaug import DepthStack, NetAugModel, netaug_step, recalibrate_bn
@@ -161,6 +161,7 @@ def test_sorting_keeps_the_max_width_network_at_every_depth(case):
     for b, a in zip(before, after):
         torch.testing.assert_close(a, b, rtol=1e-9, atol=1e-9)
     assert any((p != torch.arange(p.numel())).any() for p in perms.values())
+    assert_sorted(netaug)
     # the sorted base network is still exactly what export() returns
     exported = netaug.export().eval()
     with torch.no_grad():
@@ -202,7 +203,10 @@ def test_recalibrate_bn_at_depth_updates_extra_blocks():
     _, netaug = _make("tiny_resnet")
     bn = netaug.model.get_submodule("layers.5").extra[1].bn1
     before = bn.running_mean.clone()
-    recalibrate_bn(netaug, [_x()])  # base depth: the extra block does not run
+    with torch.no_grad():
+        bn.running_mean.normal_()  # e.g. statistics learned with update_bn_in_aug=True
+    before = bn.running_mean.clone()
+    recalibrate_bn(netaug, [_x()])  # base depth: the extra block does not run, keeps its stats
     torch.testing.assert_close(bn.running_mean, before, rtol=0, atol=0)
     recalibrate_bn(netaug, [_x()], depths=netaug.max_depths)
     assert not torch.equal(bn.running_mean, before)
@@ -276,3 +280,49 @@ def test_depth_needs_tracing():
     netaug = NetAugModel(model, _x())
     with pytest.raises(ValueError, match="pre-built graph"):
         NetAugModel(model, graph=netaug.graph, depth={"layers.1": 1})
+
+
+def test_bare_layer_as_depth_point_exports():
+    """A depth point may be a single layer (not a block): export at width and depth works."""
+    torch.manual_seed(0)
+    model = randomize(nn.Sequential(
+        nn.Conv2d(3, 8, 3, padding=1), nn.Conv2d(8, 8, 3, padding=1), nn.ReLU(),
+        nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(8, 4))).eval()
+    netaug = NetAugModel(model, _x(), depth={"1": 1}).eval()
+    x = _x()
+    for state in ("base", "max"):
+        getattr(netaug, f"set_{state}")()
+        sizes, depths, _ = netaug.state()
+        exported = netaug.export(sizes, depths).eval()
+        assert _no_package_modules(exported)
+        with torch.no_grad():
+            torch.testing.assert_close(exported(x), netaug(x), rtol=0, atol=0)
+
+
+def test_depth_keeps_per_module_train_flags():
+    """Frozen (eval-mode) submodules stay frozen when depth= is used, as without it."""
+    model = TinyResNet(BASE_WIDTHS).train()
+    frozen = ["layers.0.bn1", "layers.2.bn2"]
+    for name in frozen:
+        model.get_submodule(name).eval()
+    netaug = NetAugModel(model, _x(), depth={"layers.1": 1})
+    for name in frozen:
+        assert not netaug.model.get_submodule(name).training, name
+    assert netaug.model.get_submodule("layers.3").training
+
+
+def test_recalibrate_bn_restores_state_and_flags_on_error():
+    _, netaug = _make("tiny_resnet")
+    netaug.train()
+    netaug.model.get_submodule("layers.0.bn1").eval()
+    netaug.set_max()
+    saved = netaug.state()
+    bn = netaug.model.get_submodule("layers.0.bn1")
+    stats = bn.running_mean.clone()
+    with pytest.raises(ValueError):
+        recalibrate_bn(netaug, [_x()], depths={"no.such.block": 1})
+    assert netaug.state() == saved
+    torch.testing.assert_close(bn.running_mean, stats, rtol=0, atol=0)  # nothing was reset
+    recalibrate_bn(netaug, [_x()])
+    assert netaug.state() == saved
+    assert not bn.training and netaug.model.get_submodule("layers.1").training

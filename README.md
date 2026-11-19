@@ -327,7 +327,7 @@ assert not any(type(m).__module__.startswith("torchnetaug") for m in deploy_deep
 from torchnetaug import analyze
 
 graph = analyze(tiny, example)
-print(len(graph.free_groups()), "/", graph.num_groups, "個群組可增強")
+print(len(graph.free_groups()), "/", graph.num_groups, "groups can be augmented")
 ```
 
 模型無法被 `torch.fx` 追蹤時（`TraceError`），可以手動建立 `ChannelGraph`，再傳給 `NetAugModel(graph=...)`：

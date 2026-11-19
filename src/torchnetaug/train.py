@@ -89,26 +89,31 @@ def recalibrate_bn(
     if not bns:
         return
     saved = [(m, m.momentum) for m in bns]
-    was_training = model.training
-    previous = None
-    if isinstance(netaug, NetAugModel):
-        previous = netaug.state()
-        netaug.set_base()
-        if sizes is not None or depths is not None:
-            netaug.set_state((
-                netaug.base_sizes if sizes is None else sizes,
-                {**netaug.base_depths, **(depths or {})},
-                "custom",
-            ))
-        for m in bns:
-            if isinstance(m, DynamicBatchNorm):
-                m.update_stats = True  # set_sizes() turns it off outside base mode
-    for m in bns:
-        if m.track_running_stats:
-            m.reset_running_stats()
-            m.momentum = None  # cumulative moving average
-    model.train()
+    flags = [(m, m.training) for m in model.modules()]  # keep per-module flags (frozen BN, ...)
+    previous = netaug.state() if isinstance(netaug, NetAugModel) else None
     try:
+        if previous is not None:
+            netaug.set_base()
+            if sizes is not None or depths is not None:
+                netaug.set_state((
+                    netaug.base_sizes if sizes is None else sizes,
+                    {**netaug.base_depths, **(depths or {})},
+                    "custom",
+                ))
+            for m in bns:
+                if isinstance(m, DynamicBatchNorm):
+                    m.update_stats = True  # set_sizes() turns it off outside base mode
+        idle = set()  # BNs of extra blocks that do not run keep their statistics
+        if previous is not None:
+            for path in netaug._depth_paths:
+                stack = netaug.model.get_submodule(path)
+                for extra in stack.extra[stack.active:]:
+                    idle.update(id(m) for m in extra.modules())
+        for m in bns:
+            if m.track_running_stats and id(m) not in idle:
+                m.reset_running_stats()
+                m.momentum = None  # cumulative moving average
+        model.train()
         for i, batch in enumerate(batches):
             if num_batches is not None and i >= num_batches:
                 break
@@ -116,6 +121,7 @@ def recalibrate_bn(
     finally:
         for m, momentum in saved:
             m.momentum = momentum
-        model.train(was_training)
+        for m, flag in flags:
+            m.training = flag
         if previous is not None:
             netaug.set_state(previous)

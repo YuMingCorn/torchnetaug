@@ -75,14 +75,15 @@ def _add_depth(work: nn.Module, model: nn.Module, example_inputs: Any, depth: Ma
         )
         for p in paths
     ]
-    was_training = work.training
+    flags = [(m, m.training) for m in work.modules()]  # keep per-module flags (frozen BN, ...)
     work.eval()
     try:
         work(*(example_inputs if isinstance(example_inputs, tuple) else (example_inputs,)))
     finally:
         for h in hooks:
             h.remove()
-        work.train(was_training)
+        for m, flag in flags:
+            m.training = flag
     for p, k in paths.items():
         calls = seen[p]
         if len(calls) != 1:
@@ -460,12 +461,11 @@ class NetAugModel(nn.Module):
     def _template_layer_name(self, name: str) -> str:
         """Name in the original model of the layer that ``name`` is (or copies)."""
         for p in self._depth_paths:
-            for head in (p + ".block.", p + ".extra."):
-                if name.startswith(head):
-                    rest = name[len(head):]
-                    if head.endswith(".extra."):
-                        rest = rest.split(".", 1)[1]  # drop the copy index
-                    return p + "." + rest
+            if name == p + ".block" or name.startswith(p + ".block."):
+                return p + name[len(p + ".block"):]
+            if name.startswith(p + ".extra."):
+                _, _, rest = name[len(p + ".extra."):].partition(".")  # drop the copy index
+                return p + ("." + rest if rest else "")
         return name
 
     def _export_state(self, sizes: Sequence[int], depths: Mapping[str, int]) -> nn.Module:

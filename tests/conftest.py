@@ -134,3 +134,12 @@ def build(name: str) -> nn.Module:
 
 def clone(m):
     return copy.deepcopy(m)
+
+
+def assert_sorted(aug) -> None:
+    """After ``sort_channels()``: every free group is in non-increasing importance order,
+    and sorting again changes nothing (identity permutation for every group)."""
+    for g, imp in aug.channel_importance().items():
+        assert torch.all(imp[:-1] >= imp[1:]), f"group {g} not in non-increasing order: {imp.tolist()}"
+    for g, perm in aug.sort_channels().items():
+        assert torch.equal(perm, torch.arange(perm.numel())), f"second sort moved group {g}"

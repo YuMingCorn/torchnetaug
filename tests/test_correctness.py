@@ -10,7 +10,7 @@ import torchvision
 
 from torchnetaug import DynamicBatchNorm, NetAugModel, netaug_step, recalibrate_bn
 
-from conftest import build, example_input, randomize
+from conftest import assert_sorted, build, example_input, randomize
 
 ATOL = 1e-9
 
@@ -78,8 +78,7 @@ def test_sort_orders_importance(model_name):
     _, aug, _ = wrap(model_name)
     randomize(aug, seed=4)
     aug.sort_channels()
-    for g, imp in aug.channel_importance().items():
-        assert torch.all(imp[:-1] >= imp[1:] * (1 - 1e-9)), f"group {g} not sorted"
+    assert_sorted(aug)
 
 
 def test_sort_only_outputs_breaks_function():
