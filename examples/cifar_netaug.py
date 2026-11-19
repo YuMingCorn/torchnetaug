@@ -4,6 +4,7 @@ Example:
     uv run python examples/cifar_netaug.py --method baseline --seed 0
     uv run python examples/cifar_netaug.py --method netaug --seed 0
     uv run python examples/cifar_netaug.py --method netaug --seed 0 --sort-every 10
+    uv run python examples/cifar_netaug.py --method netaug --seed 0 --depth 1 --width-mults 1.0
 
 Each run appends one JSON line to ``--out`` (default ``runs/cifar_results.jsonl``).
 The whole dataset lives on the GPU and augmentation (random crop + flip) runs there too,
@@ -112,7 +113,7 @@ def evaluate(model: nn.Module, x: torch.Tensor, y: torch.Tensor, bs: int = 1000)
 
 def run_key(r: dict) -> tuple:
     return (r["dataset"], r["model"], r["epochs"], r["method"], r["sort_every"], r["seed"],
-            tuple(r["width_mults"]), r["alpha"], r["stop_aug"], r.get("width", 1.0))
+            tuple(r["width_mults"]), r["alpha"], r["stop_aug"], r.get("width", 1.0), r.get("depth", 0))
 
 
 def main() -> None:
@@ -136,6 +137,8 @@ def main() -> None:
                    help="NetAug only: also report accuracy of this many per-group random widths")
     p.add_argument("--width", type=float, default=1.0,
                    help="baseline only: train a plain TinyResNet at this width (reference for the exported widths)")
+    p.add_argument("--depth", type=int, default=0,
+                   help="depth augmentation: extra blocks after each TinyResNet stage (netaug only)")
     p.add_argument("--data", default="data")
     p.add_argument("--out", default="runs/cifar_results.jsonl")
     p.add_argument("--skip-existing", action="store_true", help="skip if --out already has this run")
@@ -144,7 +147,9 @@ def main() -> None:
     key = run_key({"dataset": args.dataset, "model": args.model, "epochs": args.epochs,
                    "method": args.method, "sort_every": args.sort_every if args.method == "netaug" else 0,
                    "seed": args.seed, "width_mults": args.width_mults, "alpha": args.alpha,
-                   "stop_aug": args.stop_aug, "width": args.width})
+                   "stop_aug": args.stop_aug, "width": args.width, "depth": args.depth})
+    if args.depth and (args.method != "netaug" or args.model != "resnet_tiny"):
+        p.error("--depth is only for --method netaug --model resnet_tiny")
     if args.width != 1.0 and (args.method != "baseline" or args.model != "resnet_tiny"):
         p.error("--width is only for --method baseline --model resnet_tiny")
     if args.skip_existing and Path(args.out).exists():
@@ -164,7 +169,9 @@ def main() -> None:
     base = build_model(args.model, num_classes, args.width).to(device)
     n_base = sum(p.numel() for p in base.parameters())
     if args.method == "netaug":
-        model: nn.Module = NetAugModel(base, xtr[:2], width_mults=args.width_mults)
+        # depth: the second block of each stage (layers.1, .3, .5, .7) gets extra copies
+        depth = {f"layers.{2 * s + 1}": args.depth for s in range(4)} if args.depth else None
+        model: nn.Module = NetAugModel(base, xtr[:2], width_mults=args.width_mults, depth=depth)
         print(model.graph.summary())
     else:
         model = base
@@ -245,13 +252,14 @@ def main() -> None:
     # training batches, in float32.
     calib = [xtr[k:k + 500] for k in range(0, 10000, 500)]
 
-    def eval_at(sizes) -> dict:
+    def eval_at(sizes, depths=None) -> dict:
         # All widths share the BN buffers, so calibrate each width on its own copy.
+        depths = dict(depths or model.base_depths)
         sub = copy.deepcopy(model)
-        sub.set_sizes(sizes)
-        recalibrate_bn(sub, calib, sizes=sizes)  # restores the same sizes afterwards
+        sub.set_state((sizes, depths, "custom"))
+        recalibrate_bn(sub, calib, sizes=sizes, depths=depths)  # restores the same state
         # The exported model is plain PyTorch (no torchnetaug layers) at exactly this width.
-        exported = sub.export(sizes)
+        exported = sub.export(sizes, depths)
         sub.eval(), exported.eval()
         with torch.no_grad():
             diff = (sub(xte[:1000]) - exported(xte[:1000])).abs().max().item()
@@ -273,7 +281,9 @@ def main() -> None:
         eval_rng = random.Random(10_000 + args.seed)
         for _ in range(args.eval_random):
             model.set_random(eval_rng)
-            random_acc.append(eval_at(list(model.active_sizes)))
+            random_acc.append(eval_at(list(model.active_sizes), model.active_depths))
+        if args.depth:  # base width, every extra block on
+            width_acc["depth_max"] = eval_at(list(model.base_sizes), model.max_depths)
         model.set_base()
 
     recalibrate_bn(model, calib)
@@ -282,7 +292,8 @@ def main() -> None:
     train_acc = evaluate(final, xtr[:10000], ytr[:10000])
     rec = {"method": args.method, "model": args.model, "dataset": args.dataset, "seed": args.seed,
            "epochs": args.epochs, "width_mults": args.width_mults, "alpha": args.alpha,
-           "stop_aug": args.stop_aug, "sort_every": key[4], "width": args.width, "params": n_base,
+           "stop_aug": args.stop_aug, "sort_every": key[4], "width": args.width, "depth": args.depth,
+           "params": n_base,
            "test_acc": test_acc, "train_acc": train_acc, "width_acc": width_acc,
            "random_acc": random_acc, "sort_log": sort_log, "epoch_loss": epoch_loss,
            "minutes": train_minutes}

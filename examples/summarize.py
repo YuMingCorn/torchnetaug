@@ -1,6 +1,9 @@
 """Summarize a results .jsonl file written by examples/cifar_netaug.py.
 
-    uv run python examples/summarize.py [results.jsonl]
+    uv run python examples/summarize.py [results.jsonl ...]
+
+Several files are read together (e.g. runs/cifar10_compare.jsonl runs/cifar10_depth.jsonl),
+so depth runs are paired with the baseline of the same seed.
 
 Prints three tables:
 1. mean ± std per configuration (dataset, model, epochs, method);
@@ -15,20 +18,35 @@ import sys
 from collections import defaultdict
 
 sys.stdout.reconfigure(encoding="utf-8")
-path = sys.argv[1] if len(sys.argv) > 1 else "runs/cifar_results.jsonl"
+paths = sys.argv[1:] or ["runs/cifar_results.jsonl"]
 groups = defaultdict(list)
-with open(path, encoding="utf-8") as f:
-    for line in f:
-        if not line.strip():
-            continue
-        r = json.loads(line)
-        if r["method"] == "baseline":
-            w = r.get("width", 1.0)
-            label = "baseline" if w == 1.0 else f"baseline x{w}"
-        else:
-            label = f"netaug{'+sort' + str(r['sort_every']) if r['sort_every'] else ''}"
-        key = (r["dataset"], r["model"], r["epochs"], label)
-        groups[key].append(r)
+
+
+def label_of(r: dict) -> str:
+    if r["method"] == "baseline":
+        w = r.get("width", 1.0)
+        return "baseline" if w == 1.0 else f"baseline x{w}"
+    label = "netaug"
+    if r.get("depth"):
+        kind = "width+depth" if len(r["width_mults"]) > 1 else "depth"
+        label = f"netaug {kind} (+{r['depth']}/stage)"
+    return label + (f"+sort{r['sort_every']}" if r["sort_every"] else "")
+
+
+for path in paths:
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                r = json.loads(line)
+                groups[(r["dataset"], r["model"], r["epochs"], label_of(r))].append(r)
+
+
+def is_width(key: str) -> bool:
+    try:
+        float(key)
+        return True
+    except ValueError:
+        return False
 
 
 def fmt(xs, scale=100.0):
@@ -66,7 +84,8 @@ for (ds, model, ep, label), rs in sorted(groups.items()):
 
 # Accuracy vs. width: every width exported from NetAug as a standalone plain-PyTorch
 # model, next to the same architecture trained alone at that width.
-widths = sorted({w for rs in groups.values() for r in rs for w in r.get("width_acc", {})}, key=float)
+widths = sorted({w for rs in groups.values() for r in rs for w in r.get("width_acc", {}) if is_width(w)},
+                key=float)
 for ds, model, ep in sorted({k[:3] for k in groups}):
     netaug_labels = [k[3] for k in sorted(groups) if k[:3] == (ds, model, ep) and k[3].startswith("netaug")]
     if not widths or not netaug_labels:
@@ -82,12 +101,16 @@ for ds, model, ep in sorted({k[:3] for k in groups}):
         alone_label = "baseline" if float(w) == 1.0 else f"baseline x{float(w)}"
         alone = groups.get((ds, model, ep, alone_label), [])
         cells = [f"x{w}"]
-        any_run = next(r for l in netaug_labels for r in groups[(ds, model, ep, l)] if r.get("width_acc"))
+        any_run = next(r for l in netaug_labels for r in groups[(ds, model, ep, l)]
+                       if w in r.get("width_acc", {}))
         cells.append(f"{any_run['width_acc'][w]['params']:,}")
         cells.append(fmt([r["test_acc"] for r in alone]) + f" (n={len(alone)})" if alone else "—")
         diffs = []
         for l in netaug_labels:
-            rs = [r for r in groups[(ds, model, ep, l)] if r.get("width_acc")]
+            rs = [r for r in groups[(ds, model, ep, l)] if w in r.get("width_acc", {})]
+            if not rs:
+                cells.append("—")
+                continue
             key = "export_test_acc" if all("export_test_acc" in r["width_acc"][w] for r in rs) else "test_acc"
             cells.append(fmt([r["width_acc"][w][key] for r in rs]) + f" (n={len(rs)})")
             diffs += [r["width_acc"][w].get("export_max_abs_diff", float("nan")) for r in rs]
@@ -105,3 +128,14 @@ if rand:
         ps = [x["params"] for x in items]
         print(f"| {ds} | {model} | {ep} | {label} | {len(items)} | {min(ps):,}–{max(ps):,} | "
               f"{fmt(accs)} | {min(accs) * 100:.2f} | {max(accs) * 100:.2f} |")
+
+deep = [(k, rs) for k, rs in sorted(groups.items()) if any("depth_max" in r.get("width_acc", {}) for r in rs)]
+if deep:
+    print("\n## Base width with every extra block on (exported, plain PyTorch)\n")
+    print("| dataset | model | epochs | method | params | test acc (%) | max abs(exported - dynamic) |")
+    print("|---|---|---|---|---|---|---|")
+    for (ds, model, ep, label), rs in deep:
+        items = [r["width_acc"]["depth_max"] for r in rs if "depth_max" in r.get("width_acc", {})]
+        print(f"| {ds} | {model} | {ep} | {label} | {items[0]['params']:,} | "
+              f"{fmt([x['export_test_acc'] for x in items])} (n={len(items)}) | "
+              f"{max(x['export_max_abs_diff'] for x in items):.1e} |")

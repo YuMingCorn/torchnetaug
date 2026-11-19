@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from typing import Any, Callable, Iterable, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -64,15 +64,17 @@ def recalibrate_bn(
     num_batches: Optional[int] = None,
     forward: Optional[Callable[[nn.Module, Any], Any]] = None,
     sizes: Optional[Sequence[int]] = None,
+    depths: Optional[Mapping[str, int]] = None,
 ) -> None:
     """Re-estimate batch-norm running statistics with exact averages over ``batches``.
 
     For a :class:`NetAugModel` this runs in base mode by default, so the statistics match
     the model that ``export()`` returns. Pass ``sizes`` (e.g. ``model.active_sizes`` after
-    ``set_width(2.0)``) to calibrate another width instead. All widths share the same BN
-    buffers, so calibrating one width overwrites the statistics of the others: evaluate
-    other widths on a ``copy.deepcopy`` of the model. The previous width is restored at
-    the end.
+    ``set_width(2.0)``) and/or ``depths`` (e.g. ``model.active_depths``) to calibrate another
+    width or depth instead; what is not given stays at the base value. All widths share the
+    same BN buffers, so calibrating one width overwrites the statistics of the others:
+    evaluate other widths on a ``copy.deepcopy`` of the model. The previous width and depth
+    are restored at the end.
 
     Each item of ``batches`` is passed to ``forward``; by default a ``(inputs, targets)``
     pair or a bare tensor is accepted.
@@ -90,11 +92,14 @@ def recalibrate_bn(
     was_training = model.training
     previous = None
     if isinstance(netaug, NetAugModel):
-        previous = (list(netaug.active_sizes), netaug.mode)
-        if sizes is None:
-            netaug.set_base()
-        else:
-            netaug.set_sizes(sizes, "custom")
+        previous = netaug.state()
+        netaug.set_base()
+        if sizes is not None or depths is not None:
+            netaug.set_state((
+                netaug.base_sizes if sizes is None else sizes,
+                {**netaug.base_depths, **(depths or {})},
+                "custom",
+            ))
         for m in bns:
             if isinstance(m, DynamicBatchNorm):
                 m.update_stats = True  # set_sizes() turns it off outside base mode
@@ -113,4 +118,4 @@ def recalibrate_bn(
             m.momentum = momentum
         model.train(was_training)
         if previous is not None:
-            netaug.set_sizes(*previous)
+            netaug.set_state(previous)
