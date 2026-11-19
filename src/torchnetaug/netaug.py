@@ -438,15 +438,19 @@ class NetAugModel(nn.Module):
             cloned._metadata = meta  # type: ignore[attr-defined]
             out.load_state_dict(cloned, assign=True)  # keep the model's dtype (e.g. after .double())
             # buffers outside the state_dict (persistent=False) follow the model too
-            model_buffers = {self._template_name(k): v for k, v in self.model.named_buffers()}
-            for name, buf in list(out.named_buffers()):
+            model_buffers = {self._template_name(k): v
+                             for k, v in self.model.named_buffers(remove_duplicate=False)}
+            replaced: Dict[int, torch.Tensor] = {}  # every alias of a tied buffer gets one tensor
+            for name, buf in list(out.named_buffers(remove_duplicate=False)):
                 src = model_buffers.get(name)
                 if name in cloned or src is None or not buf.is_floating_point():
                     continue
+                if id(buf) not in replaced:
+                    replaced[id(buf)] = (src.detach().clone() if src.shape == buf.shape
+                                         else buf.to(device=src.device, dtype=src.dtype))
                 owner_name, _, attr = name.rpartition(".")
                 owner = out.get_submodule(owner_name) if owner_name else out
-                owner._buffers[attr] = (src.detach().clone() if src.shape == buf.shape
-                                        else buf.to(device=src.device, dtype=src.dtype))
+                owner._buffers[attr] = replaced[id(buf)]
         p = next(self.model.parameters(), None)
         if p is not None:
             out.to(p.device)

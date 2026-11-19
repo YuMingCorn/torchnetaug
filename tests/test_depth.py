@@ -368,3 +368,40 @@ def test_export_keeps_dtype_of_non_persistent_buffers():
         with torch.no_grad():
             exported.eval()(x.double())
     torch.testing.assert_close(netaug.export().eval()(x.double()), netaug(x.double()), rtol=0, atol=0)
+
+
+def test_export_converts_every_alias_of_a_non_persistent_buffer():
+    class Shift(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.f = nn.ReLU()
+            t = torch.randn(1)
+            self.register_buffer("t1", t, persistent=False)
+            self.f.register_buffer("t2", t, persistent=False)  # same tensor under two names
+
+        def forward(self, x):
+            return self.f(x) + self.t1 + self.f.t2
+
+    class Net(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.a = nn.Conv2d(3, 4, 3)
+            self.s = Shift()
+            self.b = nn.Linear(4, 2)
+
+        def forward(self, x):
+            return self.b(self.s(self.a(x)).mean((2, 3)))
+
+    x = torch.randn(2, 3, 8, 8, dtype=torch.float32)
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)  # build in float32 directly: .float() would untie the buffers
+    try:
+        model = Net()
+    finally:
+        torch.set_default_dtype(previous)
+    assert model.s.t1 is model.s.f.t2
+    netaug = NetAugModel(model, x).double().eval()
+    exported = netaug.export().eval()
+    assert exported.s.t1.dtype == exported.s.f.t2.dtype == torch.float64
+    with torch.no_grad():
+        torch.testing.assert_close(exported(x.double()), netaug(x.double()), rtol=0, atol=0)

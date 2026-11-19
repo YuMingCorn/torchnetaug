@@ -25,7 +25,7 @@ This report answers four questions. It also records the verification method, the
 
 ## 2. Correctness verification
 
-`uv run pytest` runs 435 tests, and all pass. The tests compare outputs in float64 with tight tolerances. Before each comparison, they randomize all parameters and BN statistics, so default values cannot hide errors.
+`uv run pytest` runs 436 tests, and all pass. The tests compare outputs in float64 with tight tolerances. Before each comparison, they randomize all parameters and BN statistics, so default values cannot hide errors.
 
 | Test file | Count | What it checks |
 |---|---|---|
@@ -33,7 +33,7 @@ This report answers four questions. It also records the verification method, the
 | `test_random_architectures.py` | 61 | The same properties on 60 randomly generated architectures (combinations of residual, concat, depthwise, SE, and others), including order after sorting and idempotence |
 | `test_whitelist_lemmas.py` | 172 | The assumptions of the sorting correctness proof: whitelisted operations act on each channel independently; the permutation lemma for dynamic layers |
 | `test_widths.py` | 55 | At each width, the parameter count, weight shapes, and output equal a plain model built directly at that width |
-| `test_depth.py` | 43 | Depth augmentation (Section 5) |
+| `test_depth.py` | 44 | Depth augmentation (Section 5) |
 | `test_onnx.py` | 12 | ONNX conversion (Section 7) |
 | `test_dynamic_usage.py` | 8 | Manual use of dynamic layers, and rejection of models that contain dynamic layers (Section 6) |
 | `test_docs.py` | 4 | Every Python example in the documents runs (Chinese and English versions) |
@@ -193,3 +193,4 @@ Another approach is to provide the package's own composition modules (for exampl
 - The minutes per run are only a rough reference: during some runs, the same GPU was also running tests or other programs.
 - Depth augmentation works only on blocks that keep the shape and run once per forward pass, and it requires `torch.fx` tracing.
 - Multi-GPU (DDP) is not tested yet.
+- A custom buffer registered on a layer that is widened (Conv, Linear, BN) is not supported: it is lost when the layer is replaced by a dynamic layer.
