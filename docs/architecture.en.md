@@ -442,7 +442,7 @@ When you build your own network, use only plain layers. `NetAugModel` creates th
 
 In base mode, only the leading weights get gradients. Only the augmented forward pass gives gradients to the extra channels (test `test_netaug_step_gradients`).
 
-`recalibrate_bn()` resets the running statistics of all BN layers in base mode. Then it runs the given batches with a cumulative average (`momentum=None`). At the end, it restores the original mode, momentum, and training flag. It resets the full max-width BN, so it also clears the statistics of the augmented channels. This does not affect the base model or the export result.
+`recalibrate_bn()` resets the running statistics of all BN layers in base mode. Then it runs the given batches with a cumulative average (`momentum=None`). At the end, it restores the original width and depth, the momentum, and the training flag of every module (also when an error occurs). It resets the full max-width BN, so it also clears the statistics of the augmented channels. This does not affect the base model or the export result. The exception is an extra block that does not run at the calibrated depth: its BN is not reset and keeps its statistics.
 
 ## 9. Differences from the paper and the reference implementation
 

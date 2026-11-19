@@ -442,7 +442,7 @@ deep.set_base()
 
 base 模式下，只有前段權重有梯度；增強那次 forward 才會讓額外通道得到梯度（測試 `test_netaug_step_gradients`）。
 
-`recalibrate_bn()` 在 base 模式下把所有 BN 的 running 統計值重設，改用累積平均（`momentum=None`）跑過指定的批次，結束後還原原本的模式、momentum 和訓練旗標。它會重設整個最大寬度的 BN，所以增強通道的統計值也會被清掉；這不影響 base 模型與匯出結果。
+`recalibrate_bn()` 在 base 模式下把所有 BN 的 running 統計值重設，改用累積平均（`momentum=None`）跑過指定的批次，結束後還原原本的寬度與深度、momentum 和每個模組的訓練旗標（出錯時也會還原）。它會重設整個最大寬度的 BN，所以增強通道的統計值也會被清掉；這不影響 base 模型與匯出結果。例外是在校正的深度下不會執行的額外 block：它們的 BN 不重設，保留原本的統計值。
 
 ## 9. 與論文、參考實作的差異
 
