@@ -442,6 +442,18 @@ uv run python examples/summarize.py runs/cifar10_compare.jsonl runs/cifar10_dept
 
 結果：見下方「實驗結果」。
 
+### 適用範圍：CIFAR-100 對照實驗
+
+```bash
+bash examples/run_cifar100_regime.sh            # 4 組設定，各 3 個 seed
+uv run python examples/summarize.py runs/cifar100_regime.jsonl
+```
+
+- 同一個 TinyResNet 在 CIFAR-100（100 類）上更欠擬合。論文預測：越欠擬合，NetAug 的增益越大。
+- 4 組設定：baseline、baseline 學習率 0.2、NetAug 寬度倍數 1/2/3、NetAug 寬度倍數 1/1.2/1.4。學習率 0.2 的 baseline 用來檢查「NetAug 是否只是把 base 的梯度加倍」（見 [architecture.md 第 8.1 節](docs/architecture.md)）。
+- `--grad-log-every N`：每 N 步記錄 base 權重上 base 梯度與增強梯度的 cosine 相似度與長度比。
+- `--amp {bf16,fp16,off}`：訓練 forward 的精度。沒有 bfloat16 的 GPU（例如 T4）用 `fp16`。不同精度的結果在表中分開列出。
+
 ## 實驗結果
 
 CIFAR-10，TinyResNet（176,402 個參數），40 epochs，每種設定 3 個 seed（0、1、2）。完整設定與討論見 [docs/report.md](docs/report.md)。

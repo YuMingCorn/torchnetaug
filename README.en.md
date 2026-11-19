@@ -442,6 +442,18 @@ uv run python examples/summarize.py runs/cifar10_compare.jsonl runs/cifar10_dept
 
 Results: see "Experiment results" below.
 
+### Applicability: CIFAR-100 comparison
+
+```bash
+bash examples/run_cifar100_regime.sh            # 4 settings, 3 seeds each
+uv run python examples/summarize.py runs/cifar100_regime.jsonl
+```
+
+- The same TinyResNet underfits more on CIFAR-100 (100 classes). The paper predicts: the more a model underfits, the larger the NetAug gain.
+- 4 settings: baseline, baseline with learning rate 0.2, NetAug with width multipliers 1/2/3, NetAug with width multipliers 1/1.2/1.4. The baseline with learning rate 0.2 checks whether NetAug only doubles the base gradient (see [architecture.en.md Section 8.1](docs/architecture.en.md)).
+- `--grad-log-every N`: every N steps, record the cosine similarity and the norm ratio of the base gradient and the augmented gradient on the base weights.
+- `--amp {bf16,fp16,off}`: the precision of the training forward pass. Use `fp16` on a GPU without bfloat16 (for example the T4). Results with different precisions are listed separately in the tables.
+
 ## Experiment results
 
 CIFAR-10, TinyResNet (176,402 parameters), 40 epochs, 3 seeds (0, 1, 2) per configuration. See [docs/report.en.md](docs/report.en.md) for the full setup and discussion.
