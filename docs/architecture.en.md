@@ -269,13 +269,15 @@ Note: sorting **does** change the output of the base model. This is the purpose 
 |---|---|
 | `test_sort_keeps_max_function` | For 8 models (including ResNet, MobileNetV2/V3, EfficientNet, and concat models), in eval and train mode, the max-width output is the same before and after sorting |
 | `test_sort_only_outputs_breaks_function` | Negative control: reordering only the producer outputs (the reference implementation's approach) **always** changes the output |
-| `test_sort_orders_importance` | After sorting, the importance of each group decreases |
+| `test_sort_orders_importance` | Order after sorting (`assert_sorted`): the recomputed importance of each group is non-increasing (bit-exact, no tolerance), and sorting again gives the identity permutation. The same check also runs on the 60 random architectures and the depth-augmented models |
 | `test_permutation_commutes_with_optimizer_step` | The optimizer state is reordered correctly |
 | `test_sort_with_extra_model_keeps_ema_aligned` | The EMA model stays consistent with the main model |
 | `test_widths.py` | **Each width is the network it claims to be**: at any width (including multi-segment concat inputs), each dynamic layer type gives the same output as a plain PyTorch layer of the same size. At x1.0, x1.5, x2.0, x2.5, and x3.0, TinyResNet matches an independent model built directly at that width in parameter count, the weight shape of each layer, eval/train output, and BN statistic updates (the reference model's shapes come from the model's own constructor, not from the channel graph) |
 | `test_random_architectures.py` | **Any combination of modules**: 60 randomly generated directed acyclic graphs that mix dense conv, depthwise conv, BN, various activations, pooling, residual addition, SE multiplication, concat, Linear, and the unsupported GroupNorm, grouped convolution, layer scale, channel slicing, and channel shuffle. For each one, the test checks that base equals the original model; that the max-width output does not change after sorting by importance and after applying a fully random permutation; and that export is correct. Another test confirms that the generator really produces non-trivial structures (the numbers of free groups, member layers, and concat readers each have a lower bound) |
 
 The random tests themselves were also verified. When sorting was deliberately changed to "reorder only the outputs, not the readers' inputs" (the bug in the reference implementation), the first random architecture failed.
+
+Why the order holds: a permutation moves whole channel slices, so each channel's importance is summed from the same values in the same order. After sorting, the importances are therefore a bit-identical non-increasing sequence. `argsort(stable=True)` returns the identity permutation for an already sorted sequence (ties included), so sorting is idempotent. When sorting is changed to ascending order or to a random permutation, `assert_sorted` fails.
 
 Every test randomizes the parameters and BN statistics before it runs. The default BN values are the same for every channel, so a missing BN reorder would not be detected. After randomization, it is detected.
 

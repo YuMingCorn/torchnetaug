@@ -269,13 +269,15 @@ aug.set_base()
 |---|---|
 | `test_sort_keeps_max_function` | 8 種模型（含 ResNet、MobileNetV2/V3、EfficientNet、concat 模型），eval 與 train 模式下，排序前後最大寬度的輸出相同 |
 | `test_sort_only_outputs_breaks_function` | 反向對照：只重排產生者的輸出（參考實作的做法），輸出**一定會**改變 |
-| `test_sort_orders_importance` | 排序後每個群組的重要度遞減 |
+| `test_sort_orders_importance` | 排序後的有序性（`assert_sorted`）：每個群組重新計算的重要度非遞增（逐位元，不設容差），而且再排序一次時排列為恆等排列。同一檢查也用於 60 個隨機架構與深度增強模型 |
 | `test_permutation_commutes_with_optimizer_step` | optimizer 狀態跟著正確重排 |
 | `test_sort_with_extra_model_keeps_ema_aligned` | EMA 模型與主模型保持一致 |
 | `test_widths.py` | **每個寬度都是它宣稱的那個網路**：每種動態層在任意寬度（含 concat 的多段輸入）下，輸出等於同大小的普通 PyTorch 層；TinyResNet 在 x1.0、x1.5、x2.0、x2.5、x3.0 下，參數量、每層權重形狀、eval/train 輸出、BN 統計值更新，都等於直接用該寬度建出的獨立模型（參考模型的形狀來自模型自己的建構子，不經過通道圖） |
 | `test_random_architectures.py` | **任意模組組合**：60 個隨機產生的有向無環圖，混合 dense conv、depthwise conv、BN、各種激活、池化、殘差相加、SE 相乘、concat、Linear，以及不支援的 GroupNorm、分組卷積、layer scale、通道切片、channel shuffle。每個都檢查：base 等於原始模型；依重要度排序、再套用完全隨機的排列後，最大寬度輸出都不變；匯出正確。另有一個測試確認產生器真的產出非平凡的結構（可增強群組、member 層、concat 讀取者的數量都有下限） |
 
 這組隨機測試本身也被驗證過：把排序故意改成「只重排輸出、不重排讀取者的輸入」（參考實作的錯誤），第一個隨機架構就會失敗。
+
+有序性成立的原因：排列搬移的是整條通道切片，每個通道的重要度由相同的數值、以相同順序加總，所以排序後是逐位元相同的遞減序列；`argsort(stable=True)` 對已排序的序列（含相同值）回傳恆等排列，所以排序是冪等的。把排序改成遞增或隨機排列時，`assert_sorted` 會失敗。
 
 所有測試在跑之前都會把參數與 BN 統計值隨機化。預設的 BN 值對每個通道都一樣，漏排 BN 也測不出來；隨機化後就測得出來。
 

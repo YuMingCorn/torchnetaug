@@ -25,18 +25,18 @@
 
 ## 2. 正確性驗證
 
-`uv run pytest` 共 428 個測試，全部通過。測試在 float64 下以很緊的容差比對，而且先把所有參數與 BN 統計值隨機化，避免預設值掩蓋錯誤。
+`uv run pytest` 共 433 個測試，全部通過。測試在 float64 下以很緊的容差比對，而且先把所有參數與 BN 統計值隨機化，避免預設值掩蓋錯誤。
 
 | 測試檔 | 數量 | 驗證的事 |
 |---|---|---|
-| `test_correctness.py` | 80 | base 模式等於原始模型、匯出、排序保持最大寬度函數、optimizer 狀態重排、BN 不被增強網路污染、梯度 |
-| `test_random_architectures.py` | 61 | 60 個隨機產生的架構（殘差、concat、depthwise、SE 等組合）上的同樣性質 |
+| `test_correctness.py` | 80 | base 模式等於原始模型、匯出、排序保持最大寬度函數、排序後有序且冪等、optimizer 狀態重排、BN 不被增強網路污染、梯度 |
+| `test_random_architectures.py` | 61 | 60 個隨機產生的架構（殘差、concat、depthwise、SE 等組合）上的同樣性質，含排序後有序且冪等 |
 | `test_whitelist_lemmas.py` | 172 | 排序正確性證明的前提：白名單運算逐通道獨立、動態層的排列引理 |
 | `test_widths.py` | 55 | 每個寬度的參數量、權重形狀與輸出，等於直接用該寬度建立的普通模型 |
-| `test_depth.py` | 38 | 深度增強（第 5 節） |
+| `test_depth.py` | 41 | 深度增強（第 5 節） |
 | `test_onnx.py` | 12 | ONNX 轉換（第 7 節） |
 | `test_dynamic_usage.py` | 8 | 手動使用動態層，以及對含動態層模型的拒絕（第 6 節） |
-| `test_docs.py` | 2 | 文件中的 Python 範例都能執行（中文與英文版） |
+| `test_docs.py` | 4 | 文件中的 Python 範例都能執行（中文與英文版） |
 
 ## 3. CIFAR-10 寬度增強實驗
 
@@ -59,7 +59,11 @@ WIDTH_DISCUSSION
 
 ## 4. 通道排序
 
-排序的設計保證：最大寬度的網路函數不變，只改變較小寬度保留哪些通道。實驗中每次排序都記錄兩件事。
+排序的設計保證：最大寬度的網路函數不變，只改變較小寬度保留哪些通道。
+
+排序後的有序性由 `tests/conftest.py` 的 `assert_sorted` 檢查：每個群組重新計算的重要度必須非遞增（逐位元比較，不設容差），而且立刻再排序一次時，每個群組的排列都必須是恆等排列。這兩點成立的原因是：排列搬移的是整條通道切片，每個通道的重要度由相同的數值、以相同順序加總，排序後得到逐位元相同的遞減序列；`argsort(stable=True)` 對已排序的序列回傳恆等排列。這個檢查套用於 8 個固定模型、60 個隨機架構與 4 個深度增強模型。把排序改成遞增或隨機排列時（突變測試），檢查都會失敗。
+
+實驗中每次排序都記錄兩件事。
 
 - **最大寬度輸出的變化**：9 次排序（3 個 seed × 第 10、20、30 epoch）中最大為 8.6e-6，而 logit 的絕對值約 20 到 31。這是 float32 加總順序造成的誤差，代表排序在實際訓練的權重上也保持函數不變。
 - **移入 base 的通道數**：9 次都是 0。也就是說，排序從來沒有改變 base 模型使用的通道。
@@ -133,6 +137,9 @@ DEPTH_RESULTS
 | `export(sizes)` 建立新層時沒有沿用模型的 dtype | bfloat16（或與預設 dtype 不同）的模型匯出後無法執行 | 新層轉成原層的 dtype 與裝置；`test_export_sizes_keeps_model_dtype` |
 | 含動態層的模型被靜默接受 | 不會被加寬，匯出結果依賴本套件 | 明確的 `TypeError`；`test_dynamic_usage.py` |
 | 排序從不把通道移入 base | `+sort` 對 base 模型沒有作用 | 不是程式錯誤，是初始化尺度造成的結構性結果；在本報告與文件中說明（第 4 節） |
+| 深度增強點是單一層（不是 block）時，`export(sizes, depths)` 失敗 | 只有 base `export()` 能用 | 名稱對應補上 `P.block`、`P.extra.i` 本身；`test_bare_layer_as_depth_point_exports` |
+| `depth=` 與 `recalibrate_bn` 只還原根模組的 train/eval 狀態 | 凍結（eval）的子模組被改成訓練模式 | 逐模組保存並還原；`test_depth_keeps_per_module_train_flags` |
+| `recalibrate_bn` 在切換狀態時出錯不會還原；base 校正會清掉未執行的額外 block 的 BN 統計值 | 寬度與深度狀態遺失；`update_bn_in_aug=True` 時額外 block 的統計值被清除 | 切換移入 `try`；未執行的額外 block 不重設；`test_recalibrate_bn_restores_state_and_flags_on_error` |
 | 深度增強的原型以手寫開關實作 | 實驗結果無法代表套件行為 | 改為套件 API（`depth=`），實驗腳本改用 `examples/cifar_netaug.py --depth` |
 
 ## 9. 限制
