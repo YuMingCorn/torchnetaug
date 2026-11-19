@@ -15,7 +15,7 @@ import torch.nn as nn
 
 from torchnetaug import NetAugModel
 
-from conftest import randomize
+from conftest import assert_sorted, randomize
 
 ACTS = [nn.ReLU, nn.SiLU, nn.Hardswish, nn.Sigmoid, nn.Tanh, nn.GELU, nn.ReLU6]
 N_SEEDS = 60
@@ -165,6 +165,7 @@ def test_random_architecture(seed):
         aug.set_max()
         before = aug(x)
         aug.sort_channels()  # importance order
+        assert_sorted(aug)
         aug.set_max()
         torch.testing.assert_close(aug(x), before, atol=1e-8, rtol=1e-8, msg=f"sort, train={train_mode}")
 

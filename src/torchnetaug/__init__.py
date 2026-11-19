@@ -4,7 +4,8 @@ Reference: Han Cai, Chuang Gan, Ji Lin, Song Han. "Network Augmentation for Tiny
 Learning". ICLR 2022. https://arxiv.org/abs/2110.08890
 """
 
-from .graph import ChannelGraph, LayerRole, TraceError, analyze
+from .depth import DepthStack
+from .graph import ChannelGraph, LayerRole, TraceError, analyze, check_plain
 from .layers import DynamicBatchNorm, DynamicConv2d, DynamicLinear, DynamicModule
 from .netaug import NetAugModel
 from .train import netaug_step, recalibrate_bn
@@ -14,6 +15,8 @@ __all__ = [
     "LayerRole",
     "TraceError",
     "analyze",
+    "check_plain",
+    "DepthStack",
     "DynamicBatchNorm",
     "DynamicConv2d",
     "DynamicLinear",

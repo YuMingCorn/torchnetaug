@@ -6,12 +6,13 @@ import copy
 import random
 from collections import OrderedDict
 from contextlib import contextmanager
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 
-from .graph import ChannelGraph, analyze
+from .depth import DepthStack, make_extra
+from .graph import ChannelGraph, analyze, check_plain
 from .layers import DynamicBatchNorm, DynamicConv2d, DynamicLinear, DynamicModule, segments_index
 
 __all__ = ["NetAugModel"]
@@ -40,6 +41,68 @@ def _set_submodule(root: nn.Module, name: str, new: nn.Module) -> None:
     setattr(parent, child, new)
 
 
+@torch.no_grad()
+def _add_depth(work: nn.Module, model: nn.Module, example_inputs: Any, depth: Mapping[str, int]) -> List[str]:
+    """Replace each chosen block of ``work`` by a :class:`DepthStack`; return the paths."""
+    paths: Dict[str, int] = {}
+    for path, k in depth.items():
+        try:
+            mod = work.get_submodule(path) if path else work
+        except AttributeError as e:
+            raise ValueError(f"depth: no module named {path!r}") from e
+        if type(mod) is nn.Sequential and len(mod) > 0:  # a stage container: its last block
+            path = f"{path}.{len(mod) - 1}" if path else str(len(mod) - 1)
+            mod = work.get_submodule(path)
+        if not path:
+            raise ValueError("depth: the whole model cannot be repeated")
+        if next(mod.parameters(), None) is None:
+            raise ValueError(f"depth: {path!r} ({type(mod).__name__}) has no parameters to repeat")
+        if int(k) < 1:
+            raise ValueError(f"depth: {path!r} needs at least 1 extra block, got {k}")
+        if path in paths:
+            raise ValueError(f"depth: {path!r} is given twice")
+        paths[path] = int(k)
+    for a in paths:
+        for b in paths:
+            if a != b and b.startswith(a + "."):
+                raise ValueError(f"depth: {b!r} is inside {a!r}")
+
+    # record the input and output of every chosen block on the example input
+    seen: Dict[str, List[Tuple[Any, Any]]] = {p: [] for p in paths}
+    hooks = [
+        work.get_submodule(p).register_forward_hook(
+            lambda m, args, out, p=p: seen[p].append((args, out))
+        )
+        for p in paths
+    ]
+    flags = [(m, m.training) for m in work.modules()]  # keep per-module flags (frozen BN, ...)
+    work.eval()
+    try:
+        work(*(example_inputs if isinstance(example_inputs, tuple) else (example_inputs,)))
+    finally:
+        for h in hooks:
+            h.remove()
+        for m, flag in flags:
+            m.training = flag
+    for p, k in paths.items():
+        calls = seen[p]
+        if len(calls) != 1:
+            raise ValueError(f"depth: {p!r} must run exactly once per forward (ran {len(calls)} times)")
+        args, out = calls[0]
+        if len(args) != 1 or not isinstance(args[0], torch.Tensor) or not isinstance(out, torch.Tensor):
+            raise ValueError(f"depth: {p!r} must take one tensor and return one tensor")
+        if args[0].shape != out.shape:
+            raise ValueError(
+                f"depth: {p!r} changes the shape {tuple(args[0].shape)} -> {tuple(out.shape)}; "
+                "only shape-preserving blocks can be repeated"
+            )
+        block = work.get_submodule(p)
+        stack = DepthStack(block, [make_extra(block, out) for _ in range(k)])
+        stack.training = block.training  # only the wrapper: keep the flags inside the block
+        _set_submodule(work, p, stack)
+    return sorted(paths)
+
+
 class NetAugModel(nn.Module):
     """Wrap a tiny model for Network Augmentation training.
 
@@ -52,14 +115,21 @@ class NetAugModel(nn.Module):
         example_inputs: tensor or tuple of tensors used to trace shapes.
         width_mults: width multipliers relative to the base model. Must contain 1.0 as
             its smallest value, e.g. ``(1.0, 2.0, 3.0)``.
-        graph: a pre-built :class:`ChannelGraph` (skips ``torch.fx`` analysis).
+        graph: a pre-built :class:`ChannelGraph` (skips ``torch.fx`` analysis). Not allowed
+            together with ``depth``.
         update_bn_in_aug: if False (default), batch norm running statistics are only updated
             in base mode, so augmented passes cannot pollute the base model's statistics.
+        depth: depth augmentation, ``{module path: number of extra blocks}``. The augmented
+            models may run up to that many extra copies of the module right after it. The
+            module must keep the shape of its input and have parameters. A path to a plain
+            ``nn.Sequential`` container (a ResNet stage such as ``"layer1"``; not a subclass)
+            means its last block. See :mod:`torchnetaug.depth`.
 
     Modes:
         * ``set_base()``: the original tiny model (used for evaluation and export).
-        * ``set_max()``: every free group at its widest.
-        * ``set_random()``: each free group samples a width from its choices.
+        * ``set_max()``: every free group at its widest, every extra block on.
+        * ``set_random()``: each free group samples a width from its choices, and each
+          depth point samples how many extra blocks run.
     """
 
     def __init__(
@@ -69,16 +139,26 @@ class NetAugModel(nn.Module):
         width_mults: Sequence[float] = (1.0, 2.0, 3.0),
         graph: Optional[ChannelGraph] = None,
         update_bn_in_aug: bool = False,
+        depth: Optional[Mapping[str, int]] = None,
     ) -> None:
         super().__init__()
+        check_plain(model)
         mults = sorted(float(m) for m in width_mults)
         if not mults or mults[0] != 1.0:
             raise ValueError("width_mults must contain 1.0 as its smallest value")
+        work = copy.deepcopy(model)
+        self._depth_paths: List[str] = []
+        if depth:
+            if graph is not None:
+                raise ValueError("depth cannot be combined with a pre-built graph")
+            if example_inputs is None:
+                raise ValueError("example_inputs is required for depth augmentation")
+            self._depth_paths = _add_depth(work, model, example_inputs, depth)
         if graph is None:
             if example_inputs is None:
                 raise ValueError("example_inputs is required when graph is not given")
-            graph = analyze(model, example_inputs)
-        _check_no_shared_parameters(model, graph)
+            graph = analyze(work, example_inputs)
+        _check_no_shared_parameters(work, graph)
         self.graph = graph
         self.width_mults = tuple(mults)
         self.update_bn_in_aug = update_bn_in_aug
@@ -95,7 +175,10 @@ class NetAugModel(nn.Module):
         # Plain copy of the original model: export() loads sliced weights into a copy of it.
         self.__dict__["_template"] = copy.deepcopy(model)
 
-        self.model = copy.deepcopy(model)
+        self.model = work
+        self.max_depths: Dict[str, int] = {p: len(self._stack(p).extra) for p in self._depth_paths}
+        self.base_depths: Dict[str, int] = {p: 0 for p in self._depth_paths}
+        self.active_depths: Dict[str, int] = dict(self.base_depths)
         self._in_offsets: Dict[str, List[int]] = {}
         for name, role in graph.layers.items():
             offsets, off = [], 0
@@ -176,8 +259,12 @@ class NetAugModel(nn.Module):
         (for the base sizes: the parameter count of ``export()``).
         """
         dyn = dict(self.dynamic_layers())
+        off = [f"{p}.extra.{i}" for p, d in self.active_depths.items()
+               for i in range(d, self.max_depths[p])]
         total = 0
         for name, mod in self.model.named_modules():
+            if any(name == o or name.startswith(o + ".") for o in off):
+                continue  # extra block that does not run
             if name in dyn:
                 if isinstance(mod, (DynamicConv2d, DynamicLinear)):
                     total += mod.active_weight().numel()
@@ -191,8 +278,23 @@ class NetAugModel(nn.Module):
     # ------------------------------------------------------------------------------
     # width control
     # ------------------------------------------------------------------------------
-    def set_sizes(self, sizes: Sequence[int], mode: str = "custom") -> None:
-        """Set the active width of every channel group (one size per group)."""
+    def _stack(self, path: str) -> DepthStack:
+        return self.model.get_submodule(path)
+
+    @property
+    def is_base(self) -> bool:
+        """True when the active network is the original tiny model."""
+        return self.active_sizes == self.base_sizes and self.active_depths == self.base_depths
+
+    def state(self) -> Tuple[List[int], Dict[str, int], str]:
+        """The active widths, depths and mode; :meth:`set_state` restores them."""
+        return list(self.active_sizes), dict(self.active_depths), self.mode
+
+    def set_state(self, state: Tuple[Sequence[int], Mapping[str, int], str]) -> None:
+        sizes, depths, mode = state
+        self._apply_state(sizes, depths, mode)
+
+    def _apply_state(self, sizes: Sequence[int], depths: Mapping[str, int], mode: str) -> None:
         if len(sizes) != self.graph.num_groups:
             raise ValueError(f"expected {self.graph.num_groups} sizes, got {len(sizes)}")
         for g, s in enumerate(sizes):
@@ -200,8 +302,17 @@ class NetAugModel(nn.Module):
                 raise ValueError(f"group {g}: size {s} outside [1, {self.max_sizes[g]}]")
             if self.graph.group_fixed[g] and s != self.base_sizes[g]:
                 raise ValueError(f"group {g} is fixed at {self.base_sizes[g]} channels")
+        if set(depths) != set(self.max_depths):
+            raise ValueError(f"expected depths for {sorted(self.max_depths)}, got {sorted(depths)}")
+        for p, d in depths.items():
+            if not 0 <= d <= self.max_depths[p]:
+                raise ValueError(f"depth {p!r}: {d} extra blocks outside [0, {self.max_depths[p]}]")
         self.active_sizes = [int(s) for s in sizes]
+        self.active_depths = {p: int(d) for p, d in depths.items()}
         self.mode = mode
+        for p, d in self.active_depths.items():
+            self._stack(p).active = d
+        update = self.is_base or self.update_bn_in_aug
         for name, layer in self.dynamic_layers():
             role = self.graph.layers[name]
             layer.set_in_segments(
@@ -210,16 +321,27 @@ class NetAugModel(nn.Module):
             if role.kind == "dense":
                 layer.active_out = self.active_sizes[role.out_group]
             if isinstance(layer, DynamicBatchNorm):
-                layer.update_stats = mode == "base" or self.update_bn_in_aug
+                layer.update_stats = update
+
+    def set_sizes(self, sizes: Sequence[int], mode: str = "custom") -> None:
+        """Set the active width of every channel group (one size per group). Depth is kept."""
+        self._apply_state(sizes, self.active_depths, mode)
+
+    def set_depths(self, depths: Mapping[str, int], mode: str = "custom") -> None:
+        """Set how many extra blocks run at each depth point (0 = base). Width is kept.
+
+        Depth points not in ``depths`` keep their current value.
+        """
+        self._apply_state(self.active_sizes, {**self.active_depths, **depths}, mode)
 
     def set_base(self) -> None:
-        self.set_sizes(self.base_sizes, "base")
+        self._apply_state(self.base_sizes, self.base_depths, "base")
 
     def set_max(self) -> None:
-        self.set_sizes(self.max_sizes, "max")
+        self._apply_state(self.max_sizes, self.max_depths, "max")
 
     def set_width(self, mult: float) -> None:
-        """Scale every free group by the same multiplier (``mode == "custom"``).
+        """Scale every free group by the same multiplier (``mode == "custom"``). Depth is kept.
 
         ``mult`` may lie between the training choices (e.g. 1.5), which is useful to check
         how accuracy changes with width. Sizes are clamped to ``[1, max_size]``.
@@ -228,15 +350,17 @@ class NetAugModel(nn.Module):
             b if fixed else min(mx, max(1, round(b * mult)))
             for b, mx, fixed in zip(self.base_sizes, self.max_sizes, self.graph.group_fixed)
         ]
-        self.set_sizes(sizes, "base" if sizes == self.base_sizes else "custom")
+        base = sizes == self.base_sizes and self.active_depths == self.base_depths
+        self._apply_state(sizes, self.active_depths, "base" if base else "custom")
 
     def set_random(self, generator: Optional[random.Random] = None, granularity: str = "group") -> None:
         """Sample an augmented model.
 
         ``granularity="group"`` samples each free group on its own (a ResNet stage, an
         inverted-block expansion, ...). ``"global"`` samples one multiplier for the whole
-        model. Pass a seeded ``random.Random`` to make sampling reproducible or to keep
-        several distributed workers in sync.
+        model. Each depth point samples its number of extra blocks uniformly from
+        ``0 .. max``. Pass a seeded ``random.Random`` to make sampling reproducible or to
+        keep several distributed workers in sync.
         """
         rng = generator or random
         if granularity == "group":
@@ -249,17 +373,18 @@ class NetAugModel(nn.Module):
             ]
         else:
             raise ValueError("granularity must be 'group' or 'global'")
-        self.set_sizes(sizes, "random")
+        depths = {p: rng.randint(0, k) for p, k in self.max_depths.items()}
+        self._apply_state(sizes, depths, "random")
 
     @contextmanager
     def mode_ctx(self, mode: str, **kwargs: Any) -> Iterator["NetAugModel"]:
         """Temporarily switch mode (``"base"``, ``"max"`` or ``"random"``)."""
-        previous, prev_mode = list(self.active_sizes), self.mode
+        previous = self.state()
         getattr(self, f"set_{mode}")(**kwargs)
         try:
             yield self
         finally:
-            self.set_sizes(previous, prev_mode)
+            self.set_state(previous)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.model(*args, **kwargs)
@@ -268,18 +393,23 @@ class NetAugModel(nn.Module):
     # export
     # ------------------------------------------------------------------------------
     @torch.no_grad()
-    def export(self, sizes: Optional[Sequence[int]] = None) -> nn.Module:
-        """Return a plain PyTorch model holding the weights of one width.
+    def export(
+        self, sizes: Optional[Sequence[int]] = None, depths: Optional[Mapping[str, int]] = None
+    ) -> nn.Module:
+        """Return a plain PyTorch model holding the weights of one width and depth.
 
-        Without ``sizes`` (or with the base sizes) the result is a copy of the original
-        model, same class and same shapes. With other sizes (for example
+        Without arguments (or with the base sizes and depths) the result is a copy of the
+        original model, same class and same shapes. With other sizes (for example
         ``model.export(model.active_sizes)`` after ``set_width(2.0)``) the result keeps the
         original model's structure and ``forward``, with every resized layer replaced by a
-        plain ``nn.Conv2d`` / ``nn.Linear`` / batch-norm layer of the active size. Neither
-        result depends on this package.
+        plain ``nn.Conv2d`` / ``nn.Linear`` / batch-norm layer of the active size. With
+        ``depths``, each depth point becomes ``nn.Sequential(block, *extra_blocks)``.
+        Neither result depends on this package.
         """
-        if sizes is not None and [int(s) for s in sizes] != self.base_sizes:
-            return self._export_sizes(sizes)
+        sizes = self.base_sizes if sizes is None else [int(s) for s in sizes]
+        depths = self.base_depths if depths is None else {**self.base_depths, **depths}
+        if sizes != self.base_sizes or depths != self.base_depths:
+            return self._export_state(sizes, depths)
         with self.mode_ctx("base"):
             state = self.model.state_dict()
             for name, layer in self.dynamic_layers():
@@ -293,34 +423,86 @@ class NetAugModel(nn.Module):
                         if getattr(layer, attr) is not None:
                             state[prefix + attr] = layer._select_in(getattr(layer, attr), 0)
             out = copy.deepcopy(self._template)
-            cloned = OrderedDict((k, v.clone()) for k, v in state.items())
+            cloned = OrderedDict()
+            for k, v in state.items():
+                k = self._template_name(k)
+                if k is not None:
+                    cloned[k] = v.detach().clone()
             # keep the per-module version info: some modules (e.g. MnasNet) require it
-            cloned._metadata = getattr(state, "_metadata", None)  # type: ignore[attr-defined]
-            out.load_state_dict(cloned)
+            meta = getattr(state, "_metadata", None)
+            if meta is not None:
+                meta = OrderedDict(
+                    (self._template_name(k) if k else k, v) for k, v in meta.items()
+                    if not k or self._template_name(k) is not None
+                )
+            cloned._metadata = meta  # type: ignore[attr-defined]
+            out.load_state_dict(cloned, assign=True)  # keep the model's dtype (e.g. after .double())
+            # buffers outside the state_dict (persistent=False) follow the model too
+            model_buffers = {self._template_name(k): v
+                             for k, v in self.model.named_buffers(remove_duplicate=False)}
+            copies: Dict[int, torch.Tensor] = {}  # one copy per model tensor: ties follow the model
+            for name, buf in list(out.named_buffers(remove_duplicate=False)):
+                src = model_buffers.get(name)
+                if name in cloned or src is None or not buf.is_floating_point():
+                    continue
+                if id(src) not in copies:
+                    copies[id(src)] = (src.detach().clone() if src.shape == buf.shape
+                                       else buf.to(device=src.device, dtype=src.dtype))
+                owner_name, _, attr = name.rpartition(".")
+                owner = out.get_submodule(owner_name) if owner_name else out
+                owner._buffers[attr] = copies[id(src)]
         p = next(self.model.parameters(), None)
         if p is not None:
             out.to(p.device)
         out.train(self.training)
         return out
 
-    def _export_sizes(self, sizes: Sequence[int]) -> nn.Module:
-        previous, prev_mode = list(self.active_sizes), self.mode
-        self.set_sizes(sizes)
+    def _template_name(self, name: str) -> Optional[str]:
+        """Name in the original model of a tensor or module of ``self.model``.
+
+        For a depth point ``P``: ``P.block.x`` -> ``P.x``, ``P.block`` -> ``P``, and names
+        under ``P.extra`` (blocks the original model does not have) -> None.
+        """
+        for p in self._depth_paths:
+            if name == p + ".block":
+                return p
+            if name.startswith(p + ".block."):
+                return p + "." + name[len(p) + len(".block."):]
+            if name == p or name == p + ".extra" or name.startswith(p + ".extra."):
+                return None
+        return name
+
+    def _template_layer_name(self, name: str) -> str:
+        """Name in the original model of the layer that ``name`` is (or copies)."""
+        for p in self._depth_paths:
+            if name == p + ".block" or name.startswith(p + ".block."):
+                return p + name[len(p + ".block"):]
+            if name.startswith(p + ".extra."):
+                _, _, rest = name[len(p + ".extra."):].partition(".")  # drop the copy index
+                return p + ("." + rest if rest else "")
+        return name
+
+    def _export_state(self, sizes: Sequence[int], depths: Mapping[str, int]) -> nn.Module:
+        previous = self.state()
+        self._apply_state(sizes, depths, "custom")
         try:
             out = copy.deepcopy(self.model)
             for name, layer in self.dynamic_layers():
                 _set_submodule(out, name, self._plain_layer(name, layer))
+            for p in self._depth_paths:
+                _set_submodule(out, p, out.get_submodule(p).to_plain())
         finally:
-            self.set_sizes(previous, prev_mode)
+            self.set_state(previous)
         out.train(self.training)
         return out
 
     def _plain_layer(self, name: str, layer: DynamicModule) -> nn.Module:
         """A plain layer of the original layer's class holding ``layer``'s active slice."""
-        cls = type(self._template.get_submodule(name))
+        cls = type(self._template.get_submodule(self._template_layer_name(name)))
         n_in = layer.active_in
         tensors = list(layer.parameters()) + list(layer.buffers())
         device = tensors[0].device if tensors else torch.device("cpu")
+        dtype = tensors[0].dtype if tensors else None
         with torch.no_grad():
             if isinstance(layer, DynamicConv2d):
                 n_out = n_in if layer.depthwise else layer.active_out
@@ -340,11 +522,11 @@ class NetAugModel(nn.Module):
                 if layer.affine:
                     new.weight.copy_(layer._select_in(layer.weight, 0))
                     new.bias.copy_(layer._select_in(layer.bias, 0))
-                return new.to(device)
+                return new.to(device=device, dtype=dtype)
             new.weight.copy_(layer.active_weight())
             if layer.bias is not None:
                 new.bias.copy_(layer.active_bias())
-        return new.to(device)
+        return new.to(device=device, dtype=dtype)
 
     # ------------------------------------------------------------------------------
     # channel sorting

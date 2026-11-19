@@ -32,7 +32,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.fx.passes.shape_prop import ShapeProp, TensorMetadata
 
-__all__ = ["LayerRole", "ChannelGraph", "analyze", "TraceError"]
+from .depth import DepthStack, tie_channels
+from .layers import DynamicModule
+
+__all__ = ["LayerRole", "ChannelGraph", "analyze", "check_plain", "TraceError"]
 
 
 class TraceError(RuntimeError):
@@ -321,6 +324,8 @@ class _Analyzer:
         is_method = node.op == "call_method"
         out_shape = _shape(node)
 
+        if not is_method and t is tie_channels:
+            return self.tie(node)
         if (not is_method and t in _BINARY_FUNCTIONS) or (is_method and t in _BINARY_METHODS):
             return self.binary(node)
         if (not is_method and t in _CAT_FUNCTIONS):
@@ -362,6 +367,13 @@ class _Analyzer:
         if not participants:
             return self.opaque(node, f"binary op without channel input {node.name}")
         self.spec[node] = self.merge_specs(node, participants)
+
+    def tie(self, node: fx.Node) -> None:
+        """``tie_channels(x, ref)``: ``x`` and ``ref`` are one channel group (depth extras)."""
+        x, ref = node.args[0], node.args[1]
+        if not all(isinstance(a, fx.Node) and a in self.spec for a in (x, ref)):
+            return self.opaque(node, f"tie with unknown input {node.name}")
+        self.spec[node] = self.merge_specs(node, [self.spec[ref], self.spec[x]])
 
     def cat(self, node: fx.Node) -> None:
         tensors = node.args[0]
@@ -419,12 +431,31 @@ class _Analyzer:
         return ChannelGraph(sizes, fixed, layers, reasons)
 
 
+def check_plain(model: nn.Module, allow_depth: bool = False) -> None:
+    """Raise ``TypeError`` if ``model`` already contains torchnetaug modules.
+
+    ``NetAugModel`` and ``analyze`` take the *tiny* model built from plain ``torch.nn``
+    layers and create the dynamic layers themselves. A model that already contains dynamic
+    layers would be widened a second time, and its export would depend on this package.
+    """
+    for name, mod in model.named_modules():
+        if isinstance(mod, DynamicModule) or (isinstance(mod, DepthStack) and not allow_depth):
+            raise TypeError(
+                f"{name or 'model'} is a {type(mod).__name__}. torchnetaug expects the tiny model "
+                "built from plain torch.nn layers (nn.Conv2d, nn.Linear, nn.BatchNorm2d, ...): "
+                "NetAugModel creates the dynamic layers itself. To continue from a NetAugModel, "
+                "wrap its export() instead of its .model."
+            )
+
+
 def analyze(model: nn.Module, example_inputs: Any, tracer: Optional[fx.Tracer] = None) -> ChannelGraph:
     """Trace ``model`` with ``torch.fx`` and find its channel groups.
 
     ``example_inputs`` is a tensor or a tuple of tensors used to propagate shapes. The model
-    is copied first, so its weights and batch-norm statistics are not changed.
+    is copied first, so its weights and batch-norm statistics are not changed. The model
+    must be built from plain ``torch.nn`` layers (see :func:`check_plain`).
     """
+    check_plain(model, allow_depth=True)
     model = copy.deepcopy(model).eval()
     try:
         if tracer is None:

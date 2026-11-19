@@ -134,3 +134,21 @@ def build(name: str) -> nn.Module:
 
 def clone(m):
     return copy.deepcopy(m)
+
+
+def assert_sorted(aug, rtol: float = 1e-9) -> None:
+    """After ``sort_channels()``: every free group is in non-increasing importance order,
+    and sorting again only swaps channels whose importance is equal up to rounding.
+
+    Recomputed importances are not bit-identical: permuting the *other* groups changes the
+    order in which each reader's weights are summed. ``rtol`` covers that rounding (1e-9 is
+    far above float64 rounding; use about 1e-5 for float32).
+    """
+    for g, imp in aug.channel_importance().items():
+        ok = imp[:-1] >= imp[1:] - rtol * imp[1:].abs()
+        assert torch.all(ok), f"group {g} not in non-increasing order: {imp.tolist()}"
+    before = aug.channel_importance()
+    for g, perm in aug.sort_channels().items():
+        imp = before[g]
+        torch.testing.assert_close(imp[perm], imp, rtol=rtol, atol=0,
+                                   msg=f"second sort moved a channel of group {g} past a different importance")

@@ -1,17 +1,20 @@
 # torchnetaug
 
+**繁體中文** | [English](README.en.md)
+
 在純 PyTorch 中實作 **Network Augmentation（NetAug）**，用來提升小模型的準確率。
 
 NetAug 出自 Han Cai 等人的論文 [*Network Augmentation for Tiny Deep Learning*](https://arxiv.org/abs/2110.08890)（ICLR 2022）。小模型的問題通常是**欠擬合**，不是過擬合。NetAug 在訓練時把小模型嵌進更寬的模型裡一起訓練，讓小模型得到額外的監督訊號。訓練完只匯出小模型，**推論成本不變**。
 
 特色：
 
-- **任意模型**：用 `torch.fx` 自動分析模型的通道結構，不必手寫動態版的模型。torchvision 的 ResNet、MobileNetV2/V3、EfficientNet、DenseNet、MnasNet 都能直接使用（測試涵蓋 ResNet18、MobileNetV2/V3、ShuffleNetV2、EfficientNet-B0；MnasNet 有匯出測試）。
+- **任意模型、照 PyTorch 原本的方式組合**：用一般的 `torch.nn` 層自己組網路即可。`torch.fx` 會自動分析通道結構（哪些層共用通道、殘差、concat），寬度切換、通道排序與匯出都自動處理，不必手寫動態版的模型。torchvision 的 ResNet、MobileNetV2/V3、EfficientNet、DenseNet、MnasNet 都能直接使用（測試涵蓋 ResNet18、MobileNetV2/V3、ShuffleNetV2、EfficientNet-B0；MnasNet 有匯出測試）。
 - **殘差網路也能安全排序通道**：排序以「通道群組」為單位，殘差兩邊一定用同一個排列，最大寬度的網路函數保持不變。
 - **匯出原始類別**：`export()` 回傳的就是你原本的模型類別，部署端不需要安裝本套件。
+- **寬度與深度增強**：除了論文的寬度增強，也可以在指定的 block 後面加上額外的 block（深度增強，參考 Once-for-All 的 elastic depth）。
 - **不改你的訓練迴圈**：只要把一行 `loss.backward()` 換成 `netaug_step(...)`。
 
-內部設計與排序方式請看 [docs/architecture.md](docs/architecture.md)。
+內部設計與排序方式請看 [docs/architecture.md](docs/architecture.md)；實驗與驗證報告見 [docs/report.md](docs/report.md)；中英術語對照見 [docs/glossary.md](docs/glossary.md)。
 
 ## 安裝
 
@@ -102,6 +105,81 @@ with torch.no_grad():
 | `model.base_sizes` / `model.max_sizes` | 每個群組的原始寬度與最大寬度 |
 | `model.choices` | 每個群組可選的寬度 |
 | `model.active_sizes` / `model.mode` | 目前的寬度與模式（`"base"`、`"max"`、`"random"`、`"custom"`） |
+| `model.base_depths` / `model.max_depths` / `model.active_depths` | 每個深度增強點的額外 block 數（base 為 0；沒有用 `depth=` 時是空的 dict） |
+
+### 自行組合網路
+
+不需要繼承特定類別，也不需要使用本套件的層。用一般的 `torch.nn` 層，照 PyTorch 原本的方式寫 `__init__` 與 `forward`，再交給 `NetAugModel`。下面的網路同時有 concat、depthwise conv 與殘差相加：
+
+```python
+class Branches(nn.Module):
+    """兩條分支在通道維度 concat。"""
+    def __init__(self, c_in, c):
+        super().__init__()
+        self.a = nn.Sequential(nn.Conv2d(c_in, c, 1, bias=False), nn.BatchNorm2d(c), nn.ReLU())
+        self.b = nn.Sequential(nn.Conv2d(c_in, c, 3, padding=1, bias=False), nn.BatchNorm2d(c), nn.ReLU())
+
+    def forward(self, x):
+        return torch.cat([self.a(x), self.b(x)], dim=1)
+
+
+class SepResidual(nn.Module):
+    """depthwise + pointwise，加上殘差。"""
+    def __init__(self, c):
+        super().__init__()
+        self.dw = nn.Conv2d(c, c, 3, padding=1, groups=c, bias=False)
+        self.bn1 = nn.BatchNorm2d(c)
+        self.pw = nn.Conv2d(c, c, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(c)
+
+    def forward(self, x):
+        return x + self.bn2(self.pw(torch.relu(self.bn1(self.dw(x)))))
+
+
+class MyNet(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.stem = nn.Sequential(nn.Conv2d(3, 16, 3, padding=1, bias=False), nn.BatchNorm2d(16), nn.ReLU())
+        self.branches = Branches(16, 12)        # 輸出 24 通道 = 12 + 12
+        self.blocks = nn.Sequential(SepResidual(24), SepResidual(24))
+        self.head = nn.Linear(24, num_classes)
+
+    def forward(self, x):
+        x = self.blocks(self.branches(self.stem(x)))
+        return self.head(x.mean((2, 3)))
+
+
+mine = MyNet()
+my_model = NetAugModel(mine, example, width_mults=(1.0, 2.0))
+my_model.sort_channels()          # concat 的兩段、殘差兩邊、depthwise 都自動用一致的排列
+my_deploy = my_model.export()     # 仍是 MyNet，形狀和 mine 相同
+assert type(my_deploy) is MyNet
+```
+
+這裡沒有任何「每種 block 要怎麼排序」的程式碼。通道之間的關係（哪些層讀同一組通道、concat 後每段來自哪裡、殘差兩邊必須一致）由分析自動求出，排序與寬度切換都依照這個結果進行。
+
+請**不要**自己用 `DynamicConv2d` 等動態層組網路再交給 `NetAugModel`：動態層由 `NetAugModel` 自己建立。傳入已含動態層的模型會得到 `TypeError`，訊息會指出是哪一層。
+
+### 深度增強（`depth=`）
+
+論文與官方程式只增強寬度。本套件另外提供深度增強，做法參考同一研究團隊的 Once-for-All（elastic depth）：在指定的 block 後面加上 `k` 個額外的 block，增強網路隨機執行其中前 `0..k` 個，base 網路一個都不執行。
+
+```python
+res = torchvision.models.resnet18(num_classes=10)
+deep = NetAugModel(res, example, width_mults=(1.0, 2.0), depth={"layer1": 1, "layer3": 2})
+print(deep.max_depths)            # {'layer1.1': 1, 'layer3.1': 2}
+
+deep.set_random(rng)              # 同時抽寬度與深度
+deep.set_depths({"layer3.1": 2})  # 手動指定深度，寬度不變
+deep.set_base()                   # 原始 ResNet-18：沒有額外 block
+assert type(deep.export()) is type(res)
+```
+
+- 鍵是模組路徑，值是額外 block 的數量。路徑指向類別正好是 `nn.Sequential` 的容器（例如 ResNet 的 stage `"layer1"`）時，代表它的最後一個 block。`nn.Sequential` 的子類別（例如 torchvision 的 `Conv2dNormActivation`）視為一個 block。沒有參數的模組（例如單獨的 ReLU）不能重複。
+- 該 block 必須保持輸入的形狀（通道數與空間大小都不變），而且每次 forward 只執行一次，否則建立時會得到 `ValueError`。
+- 額外 block 是該 block 的副本，權重重新初始化。若它是殘差 block，副本最後一個 BN 的權重設為 0，一開始等於恆等函數，所以加深的網路一開始和 base 網路的函數相同。
+- 額外 block 的輸出和原 block 的輸出屬於同一個通道群組，所以無論額外 block 有沒有執行，後面的層讀到的通道順序都一致，排序在每個深度下都正確。
+- `export()` 不帶參數時一樣回傳原始模型類別。`export(sizes, depths)` 會把每個深度增強點換成 `nn.Sequential(block, *額外 block)`，仍然是普通 PyTorch 模型。
 
 ### 切換寬度
 
@@ -111,7 +189,7 @@ model.set_max()                           # 所有群組最寬
 model.set_random(rng)                     # 每個群組各自抽一個寬度
 model.set_random(rng, granularity="global")  # 整個模型抽同一個倍數
 model.set_width(1.5)                      # 所有可增強群組都乘上 1.5（可以不在 width_mults 裡）
-n_params = model.num_active_params()      # 目前寬度實際用到的參數量
+n_params = model.num_active_params()      # 目前寬度（與深度）實際用到的參數量
 model.set_sizes(model.base_sizes)         # 手動指定每個群組的寬度（mode 變成 "custom"）
 assert model.mode == "custom"
 
@@ -119,6 +197,8 @@ model.set_base()
 with model.mode_ctx("max"):               # 暫時切換，離開時還原成進入前的寬度與模式
     wide_out = model(example)
 assert model.mode == "base"
+
+state = model.state()                     # (寬度, 深度, 模式)；set_state(state) 可還原
 ```
 
 多 GPU 訓練時，讓每個 process 使用**相同種子**的 `random.Random`，各 GPU 才會抽到同一個增強網路。
@@ -182,7 +262,7 @@ model.sort_channels(optimizer=optimizer, extra_models=[ema])
 recalibrate_bn(model, [images for images, _ in fake_loader], num_batches=100)
 ```
 
-- 預設切到 base 模式，用累積平均重新估計所有 BN 的 running 統計值，結束後還原原本的寬度。
+- 預設切到 base 模式，用累積平均重新估計所有 BN 的 running 統計值，結束後還原原本的寬度與深度。
 - 每個批次可以是 `(inputs, targets)` 或單一張量；其他格式請傳 `forward=lambda m, batch: m(batch["image"])`。
 - 建議使用關掉資料增強的訓練資料。
 
@@ -199,6 +279,13 @@ for mult in (1.0, 2.0, 3.0):
     sub.eval()
     with torch.no_grad():
         logits = sub(example)          # 在這個寬度下評估
+```
+
+有深度增強時，用 `depths=` 指定深度。增強網路的前向傳遞不更新 BN 統計值，所以額外 block 的 BN 只有在這裡才會得到正確的統計值：
+
+```python
+deep_eval = copy.deepcopy(deep)
+recalibrate_bn(deep_eval, calib, depths=deep_eval.max_depths)   # base 寬度、所有額外 block
 ```
 
 ### `export`：匯出小模型
@@ -221,7 +308,16 @@ deploy_x2 = wide.export(wide.active_sizes).eval()   # 普通 PyTorch 模型，2 
 print(sum(p.numel() for p in deploy_x2.parameters()), "parameters")
 ```
 
-非 base 寬度的匯出結果保留原始模型的結構與 `forward`，只把被調整寬度的層換成同類別、作用大小的普通層。
+非 base 寬度的匯出結果保留原始模型的結構與 `forward`，只把被調整寬度的層換成同類別、作用大小的普通層。匯出的層沿用模型的 dtype（例如 bfloat16）與裝置。
+
+有深度增強時，用 `depths=` 匯出較深的網路：
+
+```python
+deploy_deep = deep_eval.export(deep_eval.base_sizes, deep_eval.max_depths).eval()
+assert not any(type(m).__module__.startswith("torchnetaug") for m in deploy_deep.modules())
+```
+
+匯出的模型可以直接轉成 ONNX（`torch.onnx.export`，dynamo 與 TorchScript 兩種匯出器都測過），onnxruntime 的輸出與 PyTorch 一致，見 `tests/test_onnx.py`。
 
 ### `analyze` 與 `ChannelGraph`：檢查或手動指定通道結構
 
@@ -231,7 +327,7 @@ print(sum(p.numel() for p in deploy_x2.parameters()), "parameters")
 from torchnetaug import analyze
 
 graph = analyze(tiny, example)
-print(len(graph.free_groups()), "/", graph.num_groups, "個群組可增強")
+print(len(graph.free_groups()), "/", graph.num_groups, "groups can be augmented")
 ```
 
 模型無法被 `torch.fx` 追蹤時（`TraceError`），可以手動建立 `ChannelGraph`，再傳給 `NetAugModel(graph=...)`：
@@ -275,7 +371,9 @@ print(wrapped.max_sizes)   # [3, 16, 32, 10]
 
 不會被增強（對應的通道維持原寬度，但模型仍然正確）：分組卷積、GroupNorm/LayerNorm、channel shuffle、layer scale 參數、`Conv1d`/`Conv3d` 等。完整清單見 [docs/architecture.md 第 2.2 節](docs/architecture.md#22-白名單分析)。
 
-最大寬度模型的參數量大約是 base 的 `max(width_mults)²` 倍，例如 `width_mults=(1.0, 2.0, 3.0)` 約 9 倍。
+最大寬度模型的參數量大約是 base 的 `max(width_mults)²` 倍，例如 `width_mults=(1.0, 2.0, 3.0)` 約 9 倍。深度增強再加上額外 block 的參數。
+
+深度增強只能用在「保持輸入形狀、每次 forward 只執行一次」的 block 上，而且需要 `torch.fx` 追蹤（不能和手動的 `graph=` 一起用）。
 
 ## 驗證
 
@@ -292,6 +390,7 @@ uv run pytest
 | base 模式輸出等於原始模型 | `test_base_mode_equals_original` |
 | 匯出模型是原始類別，形狀相同，輸出等於 base | `test_export_equals_base` |
 | 排序前後最大寬度輸出不變（殘差、concat、SE 都涵蓋） | `test_sort_keeps_max_function` |
+| 排序後的有序性：每個群組的重要度在捨入誤差內非遞增，再排序一次只交換捨入誤差內同分的通道（固定模型、60 個隨機架構、深度增強模型） | `test_sort_orders_importance`、`assert_sorted` |
 | **任意模組組合**：60 個隨機產生的架構，排序或任意排列後最大寬度輸出不變，base 與匯出也正確 | `test_random_architectures.py` |
 | 只排輸出（參考實作的做法）一定會破壞輸出 | `test_sort_only_outputs_breaks_function` |
 | optimizer 狀態跟著正確重排 | `test_permutation_commutes_with_optimizer_step` |
@@ -300,7 +399,10 @@ uv run pytest
 | 每個寬度的參數量、權重形狀、輸出，都等於直接用該寬度建出的普通模型 | `tests/test_widths.py` |
 | 數學證明的前提：白名單每個運算都逐通道獨立（排列與子集都成立），動態層的權重排列引理成立（證明見 [architecture.md 5.6](docs/architecture.md)） | `tests/test_whitelist_lemmas.py` |
 | 1 通道的空間注意力圖不會被加寬；共用權重會被拒絕；MnasNet 能匯出 | `test_one_channel_broadcast_group_is_fixed` 等 |
-| 文件中的範例都能執行 | `tests/test_docs.py` |
+| 深度增強：base 與匯出等於原始模型、殘差副本一開始是恆等函數、排序後每個深度的最大寬度輸出不變、`export(sizes, depths)` 等於動態網路、狀態還原、錯誤訊息 | `tests/test_depth.py` |
+| 匯出模型轉成 ONNX 後，onnxruntime 的輸出與 PyTorch 一致（base、×2、隨機寬度） | `tests/test_onnx.py` |
+| 手動設定寬度的動態層網路等於普通網路；含動態層的模型會被明確拒絕；`export(sizes)` 保留 dtype | `tests/test_dynamic_usage.py` |
+| 文件中的範例都能執行（中、英文版） | `tests/test_docs.py` |
 
 ### 動態寬度檢查（假資料，不需下載資料集）
 
@@ -330,7 +432,8 @@ uv run python examples/check_widths_fake_data.py
 
 ```bash
 bash examples/run_cifar10_compare.sh            # baseline、NetAug、NetAug + 排序，各 3 個 seed
-uv run python examples/summarize.py runs/cifar10_compare.jsonl
+bash examples/run_cifar10_depth.sh              # 深度增強、寬度 + 深度增強，各 3 個 seed
+uv run python examples/summarize.py runs/cifar10_compare.jsonl runs/cifar10_depth.jsonl
 ```
 
 - 每次執行在 jsonl 檔加一行，記錄 base 模型的測試與訓練準確率。
@@ -338,6 +441,54 @@ uv run python examples/summarize.py runs/cifar10_compare.jsonl
 - 單次執行的差距可能只是雜訊，所以比較 3 個 seed 的平均與標準差。
 
 結果：見下方「實驗結果」。
+
+### 適用範圍：CIFAR-100 對照實驗
+
+```bash
+bash examples/run_cifar100_regime.sh            # 4 組設定，各 3 個 seed
+uv run python examples/summarize.py runs/cifar100_regime.jsonl
+```
+
+- 同一個 TinyResNet 在 CIFAR-100（100 類）上更欠擬合。論文預測：越欠擬合，NetAug 的增益越大。
+- 4 組設定：baseline、baseline 學習率 0.2、NetAug 寬度倍數 1/2/3、NetAug 寬度倍數 1/1.2/1.4。學習率 0.2 的 baseline 用來檢查「NetAug 是否只是把 base 的梯度加倍」（見 [architecture.md 第 8.1 節](docs/architecture.md)）。
+- `--grad-log-every N`：每 N 步記錄 base 權重上 base 梯度與增強梯度的 cosine 相似度與長度比。
+- `--amp {bf16,fp16,off}`：訓練 forward 的精度。沒有 bfloat16 的 GPU（例如 T4）用 `fp16`。不同精度的結果在表中分開列出。
+
+## 實驗結果
+
+CIFAR-10，TinyResNet（176,402 個參數），40 epochs，每種設定 3 個 seed（0、1、2）。完整設定與討論見 [docs/report.md](docs/report.md)。
+
+**base 寬度（部署的模型）**
+
+| 方法 | test acc (%) | train acc (%) | 與 baseline 的配對差異（百分點） |
+|---|---|---|---|
+| baseline | 86.92 ± 0.35 | 91.90 ± 0.23 | — |
+| netaug | 87.07 ± 0.39 | 92.70 ± 0.20 | +0.15 ± 0.74 |
+| netaug+sort10 | 87.26 ± 0.09 | 92.81 ± 0.23 | +0.34 ± 0.44 |
+
+**各寬度：從 NetAug 模型匯出 vs. 單獨訓練（test acc %）**
+
+| 寬度 | 參數量 | 單獨訓練 | netaug 匯出 | netaug+sort10 匯出 |
+|---|---|---|---|---|
+| ×1.0 | 176,402 | 86.92 ± 0.35 | 87.07 ± 0.39 | 87.26 ± 0.09 |
+| ×1.5 | 395,350 | 89.27 ± 0.11 | 87.48 ± 0.25 | 88.00 ± 0.13 |
+| ×2.0 | 701,466 | 90.46 ± 0.27 | 88.22 ± 0.16 | 88.48 ± 0.21 |
+| ×3.0 | 1,575,202 | 91.62 ± 0.30 | 88.44 ± 0.18 | 88.50 ± 0.27 |
+
+- base 模型的增益很小，小於 seed 之間的差異，3 個 seed 不足以判定有效。每個 seed 的訓練準確率都上升 0.7–1.3 個百分點，符合「緩解欠擬合」的機制。
+- 較寬的匯出模型不如同寬度單獨訓練的模型；NetAug 的目標是 base 模型。
+- 排序從未把通道移入 base（初始化尺度造成，見 report 第 4 節），所以 `+sort10` 對 base 沒有作用。
+- 所有匯出模型與動態網路的輸出差異都是 0。
+
+**深度增強**（每個 stage 的最後一個 block 之後加 1 個額外 block，`--depth 1`）
+
+| 方法 | test acc (%) | train acc (%) | 與 baseline 的配對差異（百分點） |
+|---|---|---|---|
+| 深度增強 | 86.87 ± 0.20 | 92.28 ± 0.16 | −0.05 ± 0.29 |
+| 寬度 + 深度增強 | 86.96 ± 0.05 | 92.77 ± 0.21 | +0.04 ± 0.34 |
+
+- 深度增強對 base 模型沒有可測量的效果，加上深度也沒有讓寬度增強變好。
+- 開啟所有額外 block 的匯出網路（274,802 個參數）準確率 86.92 ± 0.17，與 base 相同：額外 block 是從恆等函數開始的殘差副本，只在被抽到時才訓練，40 個 epoch 內幾乎沒有學到東西。
 
 ## 引用與參考資料
 

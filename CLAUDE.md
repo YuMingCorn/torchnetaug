@@ -17,9 +17,12 @@
 
 ## 套件與驗證
 
-- 架構與排序方式：[docs/architecture.md](docs/architecture.md)；用法：[README.md](README.md)。
-- `uv run pytest`：正確性測試，以及 `tests/test_docs.py`（README 與 architecture.md 裡的 python 區塊都必須能執行）。改了 API 就要同步改文件。
-- 效果實驗：`examples/cifar_netaug.py`，資料放在 `data/`（不進 git）。
+- 架構與排序方式：[docs/architecture.md](docs/architecture.md)；用法：[README.md](README.md)；驗證與實驗報告：[docs/report.md](docs/report.md)；術語對照：[docs/glossary.md](docs/glossary.md)。
+- 文件中英並列：中文是 `X.md`，英文是同目錄的 `X.en.md`，兩者開頭互相連結，術語依 glossary。改中文就要同步改英文。
+- `uv run pytest`：正確性測試，以及 `tests/test_docs.py`（`DOCS` 清單中每份文件的 python 區塊都必須能執行，含英文版）。改了 API 就要同步改文件。ONNX 測試需要開發依賴 onnx、onnxscript、onnxruntime，沒裝時會跳過。
+- 增強維度：寬度（論文）與深度（`depth=`，參考 Once-for-All elastic depth；官方程式與 `netaug/` 都沒有深度增強）。
+- `NetAugModel` 只接受普通 `torch.nn` 層組成的模型；含動態層會丟 `TypeError`（2026-11-19 決定，替代方案見 report.md 第 6.3 節）。
+- 效果實驗：`examples/cifar_netaug.py`（`--depth` 為深度增強），資料放在 `data/`（不進 git）；`examples/summarize.py` 可同時讀多個 jsonl。
 
 ## 參考資料
 

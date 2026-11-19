@@ -1,6 +1,9 @@
 """Summarize a results .jsonl file written by examples/cifar_netaug.py.
 
-    uv run python examples/summarize.py [results.jsonl]
+    uv run python examples/summarize.py [results.jsonl ...]
+
+Several files are read together (e.g. runs/cifar10_compare.jsonl runs/cifar10_depth.jsonl),
+so depth runs are paired with the baseline of the same seed.
 
 Prints three tables:
 1. mean ± std per configuration (dataset, model, epochs, method);
@@ -15,20 +18,49 @@ import sys
 from collections import defaultdict
 
 sys.stdout.reconfigure(encoding="utf-8")
-path = sys.argv[1] if len(sys.argv) > 1 else "runs/cifar_results.jsonl"
+paths = sys.argv[1:] or ["runs/cifar_results.jsonl"]
 groups = defaultdict(list)
-with open(path, encoding="utf-8") as f:
-    for line in f:
-        if not line.strip():
-            continue
-        r = json.loads(line)
-        if r["method"] == "baseline":
-            w = r.get("width", 1.0)
-            label = "baseline" if w == 1.0 else f"baseline x{w}"
-        else:
-            label = f"netaug{'+sort' + str(r['sort_every']) if r['sort_every'] else ''}"
-        key = (r["dataset"], r["model"], r["epochs"], label)
-        groups[key].append(r)
+
+
+def recipe(r: dict) -> str:
+    """Suffix for a learning rate, weight decay or precision other than the defaults (0.1, 5e-4, bf16)."""
+    out = ""
+    if r.get("lr", 0.1) != 0.1:
+        out += f" lr{r['lr']:g}"
+    if r.get("wd", 5e-4) != 5e-4:
+        out += f" wd{r['wd']:g}"
+    if r.get("amp", "bf16") != "bf16":
+        out += f" amp-{r['amp']}"
+    return out
+
+
+def label_of(r: dict) -> str:
+    if r["method"] == "baseline":
+        w = r.get("width", 1.0)
+        return ("baseline" if w == 1.0 else f"baseline x{w}") + recipe(r)
+    label = "netaug"
+    if r.get("depth"):
+        kind = "width+depth" if len(r["width_mults"]) > 1 else "depth"
+        label = f"netaug {kind} (+{r['depth']}/stage)"
+    if len(r["width_mults"]) > 1 and list(r["width_mults"]) != [1.0, 2.0, 3.0]:
+        label += " x(" + "/".join(f"{m:g}" for m in r["width_mults"]) + ")"
+    return label + (f"+sort{r['sort_every']}" if r["sort_every"] else "") + recipe(r)
+
+
+for path in paths:
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                r = json.loads(line)
+                groups[(r["dataset"], r["model"], r["epochs"], label_of(r))].append(r)
+
+
+def is_width(key: str) -> bool:
+    try:
+        float(key)
+        return True
+    except ValueError:
+        return False
 
 
 def fmt(xs, scale=100.0):
@@ -66,9 +98,10 @@ for (ds, model, ep, label), rs in sorted(groups.items()):
 
 # Accuracy vs. width: every width exported from NetAug as a standalone plain-PyTorch
 # model, next to the same architecture trained alone at that width.
-widths = sorted({w for rs in groups.values() for r in rs for w in r.get("width_acc", {})}, key=float)
 for ds, model, ep in sorted({k[:3] for k in groups}):
     netaug_labels = [k[3] for k in sorted(groups) if k[:3] == (ds, model, ep) and k[3].startswith("netaug")]
+    widths = sorted({w for l in netaug_labels for r in groups[(ds, model, ep, l)]
+                     for w in r.get("width_acc", {}) if is_width(w)}, key=float)
     if not widths or not netaug_labels:
         continue
     print(f"\n## Exported models at each width ({ds}, {model}, {ep} epochs)\n")
@@ -82,12 +115,16 @@ for ds, model, ep in sorted({k[:3] for k in groups}):
         alone_label = "baseline" if float(w) == 1.0 else f"baseline x{float(w)}"
         alone = groups.get((ds, model, ep, alone_label), [])
         cells = [f"x{w}"]
-        any_run = next(r for l in netaug_labels for r in groups[(ds, model, ep, l)] if r.get("width_acc"))
+        any_run = next(r for l in netaug_labels for r in groups[(ds, model, ep, l)]
+                       if w in r.get("width_acc", {}))
         cells.append(f"{any_run['width_acc'][w]['params']:,}")
         cells.append(fmt([r["test_acc"] for r in alone]) + f" (n={len(alone)})" if alone else "—")
         diffs = []
         for l in netaug_labels:
-            rs = [r for r in groups[(ds, model, ep, l)] if r.get("width_acc")]
+            rs = [r for r in groups[(ds, model, ep, l)] if w in r.get("width_acc", {})]
+            if not rs:
+                cells.append("—")
+                continue
             key = "export_test_acc" if all("export_test_acc" in r["width_acc"][w] for r in rs) else "test_acc"
             cells.append(fmt([r["width_acc"][w][key] for r in rs]) + f" (n={len(rs)})")
             diffs += [r["width_acc"][w].get("export_max_abs_diff", float("nan")) for r in rs]
@@ -105,3 +142,31 @@ if rand:
         ps = [x["params"] for x in items]
         print(f"| {ds} | {model} | {ep} | {label} | {len(items)} | {min(ps):,}–{max(ps):,} | "
               f"{fmt(accs)} | {min(accs) * 100:.2f} | {max(accs) * 100:.2f} |")
+
+deep = [(k, rs) for k, rs in sorted(groups.items()) if any("depth_max" in r.get("width_acc", {}) for r in rs)]
+if deep:
+    print("\n## Base width with every extra block on (exported, plain PyTorch)\n")
+    print("| dataset | model | epochs | method | params | test acc (%) | max abs(exported - dynamic) |")
+    print("|---|---|---|---|---|---|---|")
+    for (ds, model, ep, label), rs in deep:
+        items = [r["width_acc"]["depth_max"] for r in rs if "depth_max" in r.get("width_acc", {})]
+        print(f"| {ds} | {model} | {ep} | {label} | {items[0]['params']:,} | "
+              f"{fmt([x['export_test_acc'] for x in items])} (n={len(items)}) | "
+              f"{max(x['export_max_abs_diff'] for x in items):.1e} |")
+
+grads = [(k, rs) for k, rs in sorted(groups.items()) if any(r.get("grad_log") for r in rs)]
+if grads:
+    print("\n## Base vs. augmented gradient on the base weights\n")
+    print("cos = cosine similarity of dL(base)/dW and dL(aug)/dW on the base entries; "
+          "ratio = |dL(aug)/dW| / |dL(base)/dW|. Mean over seeds and over the logged steps "
+          "of each epoch range.\n")
+    print("| dataset | model | epochs | method | epochs range | cos | ratio |")
+    print("|---|---|---|---|---|---|---|")
+    for (ds, model, ep, label), rs in grads:
+        edges = sorted({0, 1, ep // 4, ep // 2, 3 * ep // 4, ep})
+        for lo, hi in zip(edges, edges[1:]):
+            rows = [g for r in rs for g in r.get("grad_log", []) if lo <= g["epoch"] < hi and "cos" in g]
+            if rows:
+                cos = statistics.mean(g["cos"] for g in rows)
+                ratio = statistics.mean(g["ratio"] for g in rows)
+                print(f"| {ds} | {model} | {ep} | {label} | {lo + 1}–{hi} | {cos:.3f} | {ratio:.2f} |")

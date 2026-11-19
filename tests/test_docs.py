@@ -12,7 +12,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-DOCS = ["README.md", "docs/architecture.md"]
+DOCS = ["README.md", "README.en.md", "docs/architecture.md", "docs/architecture.en.md"]
 BLOCK = re.compile(r"^```python\n(.*?)^```", re.S | re.M)
 
 

@@ -4,13 +4,15 @@ Example:
     uv run python examples/cifar_netaug.py --method baseline --seed 0
     uv run python examples/cifar_netaug.py --method netaug --seed 0
     uv run python examples/cifar_netaug.py --method netaug --seed 0 --sort-every 10
+    uv run python examples/cifar_netaug.py --method netaug --seed 0 --depth 1 --width-mults 1.0
 
 Each run appends one JSON line to ``--out`` (default ``runs/cifar_results.jsonl``).
 The whole dataset lives on the GPU and augmentation (random crop + flip) runs there too,
 so no DataLoader workers are needed.
 
-Training runs the forward pass in bfloat16; the loss, BN calibration and all
-evaluation run in float32.
+Training runs the forward pass in bfloat16 by default (``--amp fp16`` for GPUs without
+bfloat16, such as the T4, with a gradient scaler; ``--amp off`` for float32). The loss,
+BN calibration and all evaluation run in float32.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
-from torchnetaug import NetAugModel, netaug_step, recalibrate_bn
+from torchnetaug import DynamicConv2d, DynamicLinear, NetAugModel, netaug_step, recalibrate_bn
 
 MEAN = {"cifar10": (0.4914, 0.4822, 0.4465), "cifar100": (0.5071, 0.4865, 0.4409)}
 STD = {"cifar10": (0.2470, 0.2435, 0.2616), "cifar100": (0.2673, 0.2564, 0.2762)}
@@ -112,7 +114,82 @@ def evaluate(model: nn.Module, x: torch.Tensor, y: torch.Tensor, bs: int = 1000)
 
 def run_key(r: dict) -> tuple:
     return (r["dataset"], r["model"], r["epochs"], r["method"], r["sort_every"], r["seed"],
-            tuple(r["width_mults"]), r["alpha"], r["stop_aug"], r.get("width", 1.0))
+            tuple(r["width_mults"]), r["alpha"], r["stop_aug"], r.get("width", 1.0), r.get("depth", 0),
+            r.get("lr", 0.1), r.get("wd", 5e-4), r.get("amp", "bf16"))
+
+
+def base_masks(model: NetAugModel) -> dict:
+    """For each resized parameter, a bool mask of the entries the base model uses.
+
+    Built by differentiating the base slice of each dynamic layer, so it follows the
+    same indexing as the forward pass (including concat segments). The extra blocks of
+    depth augmentation are not part of the base model: all their entries are masked out.
+    """
+    masks = {}
+    with model.mode_ctx("base"), torch.enable_grad():
+        for _, layer in model.dynamic_layers():
+            for attr in ("weight", "bias"):
+                p = getattr(layer, attr, None)
+                if p is None:
+                    continue
+                if isinstance(layer, (DynamicConv2d, DynamicLinear)):
+                    sliced = layer.active_weight() if attr == "weight" else layer.active_bias()
+                else:  # batch norm: input channels only
+                    sliced = layer._select_in(p, 0)
+                (g,) = torch.autograd.grad(sliced.sum(), p)
+                masks[id(p)] = g != 0
+    for path in model._depth_paths:
+        for p in model.model.get_submodule(path).extra.parameters():
+            masks[id(p)] = torch.zeros_like(p, dtype=torch.bool)
+    return masks
+
+
+class GradProbe:
+    """Split one NetAug step's gradient into the base and the augmented part.
+
+    ``netaug_step`` accumulates ``dL(base)/dW`` and then ``alpha * dL(aug)/dW`` into the
+    same ``.grad``. Snapshots after each backward give both parts. Only the entries of the
+    base model (``W_t`` in the paper) are compared: cosine similarity and norm ratio
+    ``|g_aug| / |g_base|``.
+    """
+
+    def __init__(self, model: NetAugModel, alpha: float, backward=lambda loss: loss.backward()) -> None:
+        self._backward = backward
+        self.params = [p for p in model.parameters() if p.requires_grad]
+        masks = base_masks(model)
+        self.masks = [masks.get(id(p)) for p in self.params]
+        self.alpha = alpha
+        self.snaps: list = []
+        self.cos: list = []
+        self.ratio: list = []
+
+    def _flat_base(self) -> torch.Tensor:
+        parts = []
+        for p, m in zip(self.params, self.masks):
+            g = p.grad if p.grad is not None else torch.zeros_like(p)
+            parts.append((g[m] if m is not None else g.reshape(-1)).float())
+        return torch.cat(parts)
+
+    def backward(self, loss: torch.Tensor) -> None:
+        self._backward(loss)  # a gradient scaler scales both parts alike: cos and ratio stay
+        self.snaps.append(self._flat_base())
+
+    def finish_step(self) -> None:
+        if len(self.snaps) == 2:
+            g_base = self.snaps[0]
+            g_aug = (self.snaps[1] - self.snaps[0]) / self.alpha
+            cos = F.cosine_similarity(g_base, g_aug, dim=0).item()
+            ratio = (g_aug.norm() / g_base.norm()).item()
+            if math.isfinite(cos) and math.isfinite(ratio):  # an fp16 overflow step is skipped
+                self.cos.append(cos)
+                self.ratio.append(ratio)
+        self.snaps = []
+
+    def epoch_summary(self) -> dict:
+        out = {"cos": sum(self.cos) / len(self.cos), "ratio": sum(self.ratio) / len(self.ratio),
+               "n": len(self.cos)} if self.cos else {}
+        self.cos, self.ratio = [], []
+        return out
 
 
 def main() -> None:
@@ -124,6 +201,8 @@ def main() -> None:
     p.add_argument("--bs", type=int, default=128)
     p.add_argument("--lr", type=float, default=0.1)
     p.add_argument("--wd", type=float, default=5e-4)
+    p.add_argument("--amp", default="bf16", choices=["bf16", "fp16", "off"],
+                   help="mixed precision of the training forward pass (fp16 uses a gradient scaler)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--width-mults", type=float, nargs="+", default=[1.0, 2.0, 3.0])
     p.add_argument("--alpha", type=float, default=1.0)
@@ -136,6 +215,11 @@ def main() -> None:
                    help="NetAug only: also report accuracy of this many per-group random widths")
     p.add_argument("--width", type=float, default=1.0,
                    help="baseline only: train a plain TinyResNet at this width (reference for the exported widths)")
+    p.add_argument("--depth", type=int, default=0,
+                   help="depth augmentation: extra blocks after each TinyResNet stage (netaug only)")
+    p.add_argument("--grad-log-every", type=int, default=0,
+                   help="NetAug only: every N steps, compare the base and augmented gradients "
+                        "on the base weights (cosine, norm ratio); 0 = never")
     p.add_argument("--data", default="data")
     p.add_argument("--out", default="runs/cifar_results.jsonl")
     p.add_argument("--skip-existing", action="store_true", help="skip if --out already has this run")
@@ -144,7 +228,10 @@ def main() -> None:
     key = run_key({"dataset": args.dataset, "model": args.model, "epochs": args.epochs,
                    "method": args.method, "sort_every": args.sort_every if args.method == "netaug" else 0,
                    "seed": args.seed, "width_mults": args.width_mults, "alpha": args.alpha,
-                   "stop_aug": args.stop_aug, "width": args.width})
+                   "stop_aug": args.stop_aug, "width": args.width, "depth": args.depth,
+                   "lr": args.lr, "wd": args.wd, "amp": args.amp})
+    if args.depth and (args.method != "netaug" or args.model != "resnet_tiny"):
+        p.error("--depth is only for --method netaug --model resnet_tiny")
     if args.width != 1.0 and (args.method != "baseline" or args.model != "resnet_tiny"):
         p.error("--width is only for --method baseline --model resnet_tiny")
     if args.skip_existing and Path(args.out).exists():
@@ -164,7 +251,9 @@ def main() -> None:
     base = build_model(args.model, num_classes, args.width).to(device)
     n_base = sum(p.numel() for p in base.parameters())
     if args.method == "netaug":
-        model: nn.Module = NetAugModel(base, xtr[:2], width_mults=args.width_mults)
+        # depth: the second block of each stage (layers.1, .3, .5, .7) gets extra copies
+        depth = {f"layers.{2 * s + 1}": args.depth for s in range(4)} if args.depth else None
+        model: nn.Module = NetAugModel(base, xtr[:2], width_mults=args.width_mults, depth=depth)
         print(model.graph.summary())
     else:
         model = base
@@ -182,9 +271,15 @@ def main() -> None:
     def crit(out, y):  # float32 loss even though the forward pass runs in bf16
         return F.cross_entropy(out.float(), y)
 
+    amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(args.amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp == "fp16")
+
     def fwd(m, inp):
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
             return m(inp)
+
+    def backward(loss):
+        scaler.scale(loss).backward()
 
     sort_log = []
 
@@ -213,6 +308,9 @@ def main() -> None:
         sort_log.append(entry)
         print("sort:", entry, flush=True)
 
+    probe = GradProbe(model, args.alpha, backward) if args.method == "netaug" and args.grad_log_every else None
+    grad_log = []
+
     epoch_loss = []
     t0 = time.time()
     for epoch in range(args.epochs):
@@ -225,33 +323,44 @@ def main() -> None:
             idx = perm[s * args.bs:(s + 1) * args.bs]
             xb, yb = augment(xtr[idx], gen), ytr[idx]
             if args.method == "netaug":
+                logged = probe is not None and s % args.grad_log_every == 0
                 loss, _ = netaug_step(model, xb, yb, crit, alpha=args.alpha, augment=epoch < aug_until,
-                                      generator=rng, forward=fwd)
+                                      generator=rng, forward=fwd,
+                                      backward=probe.backward if logged else backward)
+                if logged:
+                    probe.finish_step()
             else:
                 loss = crit(fwd(model, xb), yb)
-                loss.backward()
+                backward(loss)
                 loss = loss.detach()
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             opt.zero_grad(set_to_none=True)
             sched.step()
             loss_sum += loss
         epoch_loss.append(loss_sum.item() / steps_per_epoch)  # base-model training loss
+        if probe is not None:
+            grad_log.append({"epoch": epoch, **probe.epoch_summary()})
         if (epoch + 1) % 5 == 0 or epoch + 1 == args.epochs:
+            g = ""
+            if grad_log and "cos" in grad_log[-1]:
+                g = f"  grad cos {grad_log[-1]['cos']:.3f} ratio {grad_log[-1]['ratio']:.2f}"
             print(f"epoch {epoch + 1}/{args.epochs}  base loss {epoch_loss[-1]:.3f}  "
-                  f"{time.time() - t0:.0f}s", flush=True)
+                  f"{time.time() - t0:.0f}s{g}", flush=True)
     train_minutes = (time.time() - t0) / 60
 
     # Every evaluated model gets the same BN calibration: exact averages over 20 clean
     # training batches, in float32.
     calib = [xtr[k:k + 500] for k in range(0, 10000, 500)]
 
-    def eval_at(sizes) -> dict:
+    def eval_at(sizes, depths=None) -> dict:
         # All widths share the BN buffers, so calibrate each width on its own copy.
+        depths = dict(depths or model.base_depths)
         sub = copy.deepcopy(model)
-        sub.set_sizes(sizes)
-        recalibrate_bn(sub, calib, sizes=sizes)  # restores the same sizes afterwards
+        sub.set_state((sizes, depths, "custom"))
+        recalibrate_bn(sub, calib, sizes=sizes, depths=depths)  # restores the same state
         # The exported model is plain PyTorch (no torchnetaug layers) at exactly this width.
-        exported = sub.export(sizes)
+        exported = sub.export(sizes, depths)
         sub.eval(), exported.eval()
         with torch.no_grad():
             diff = (sub(xte[:1000]) - exported(xte[:1000])).abs().max().item()
@@ -273,7 +382,9 @@ def main() -> None:
         eval_rng = random.Random(10_000 + args.seed)
         for _ in range(args.eval_random):
             model.set_random(eval_rng)
-            random_acc.append(eval_at(list(model.active_sizes)))
+            random_acc.append(eval_at(list(model.active_sizes), model.active_depths))
+        if args.depth:  # base width, every extra block on
+            width_acc["depth_max"] = eval_at(list(model.base_sizes), model.max_depths)
         model.set_base()
 
     recalibrate_bn(model, calib)
@@ -282,9 +393,11 @@ def main() -> None:
     train_acc = evaluate(final, xtr[:10000], ytr[:10000])
     rec = {"method": args.method, "model": args.model, "dataset": args.dataset, "seed": args.seed,
            "epochs": args.epochs, "width_mults": args.width_mults, "alpha": args.alpha,
-           "stop_aug": args.stop_aug, "sort_every": key[4], "width": args.width, "params": n_base,
+           "stop_aug": args.stop_aug, "sort_every": key[4], "width": args.width, "depth": args.depth,
+           "lr": args.lr, "wd": args.wd, "amp": args.amp, "params": n_base,
            "test_acc": test_acc, "train_acc": train_acc, "width_acc": width_acc,
            "random_acc": random_acc, "sort_log": sort_log, "epoch_loss": epoch_loss,
+           "grad_log": grad_log,
            "minutes": train_minutes}
     print(json.dumps(rec))
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
