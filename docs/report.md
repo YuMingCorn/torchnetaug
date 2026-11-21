@@ -25,15 +25,15 @@
 
 ## 2. 正確性驗證
 
-`uv run pytest` 共 460 個測試，全部通過。測試在 float64 下以很緊的容差比對，而且先把所有參數與 BN 統計值隨機化，避免預設值掩蓋錯誤。
+`uv run pytest` 共 471 個測試，全部通過。測試在 float64 下以很緊的容差比對，而且先把所有參數與 BN 統計值隨機化，避免預設值掩蓋錯誤。
 
 | 測試檔 | 數量 | 驗證的事 |
 |---|---|---|
-| `test_correctness.py` | 104 | base 模式等於原始模型、匯出、排序保持最大寬度函數、排序後有序且冪等、optimizer 狀態重排、BN 不被增強網路污染、梯度（含逐元素等於論文 Eq. 2） |
+| `test_correctness.py` | 111 | base 模式等於原始模型、匯出（含 float32 預設下的 float64 精度、逐模組旗標與 `requires_grad`）、排序保持最大寬度函數、排序後有序且冪等、optimizer 狀態重排、BN 不被增強網路污染、梯度（含逐元素等於論文 Eq. 2）、白名單邊界防護（低秩廣播、張量 `clamp`、硬編碼 `view`/`squeeze`、無參數 BN、`SyncBatchNorm`） |
 | `test_random_architectures.py` | 61 | 60 個隨機產生的架構（殘差、concat、depthwise、SE 等組合）上的同樣性質，含排序後有序且冪等 |
 | `test_whitelist_lemmas.py` | 172 | 排序正確性證明的前提：白名單運算逐通道獨立、動態層的排列引理 |
 | `test_widths.py` | 55 | 每個寬度的參數量、權重形狀與輸出，等於直接用該寬度建立的普通模型 |
-| `test_depth.py` | 44 | 深度增強（第 5 節） |
+| `test_depth.py` | 48 | 深度增強（第 5 節），含加寬後殘差恆等初始化、全零範例輸入防護與寬度+深度 Eq. 2 梯度測試 |
 | `test_onnx.py` | 12 | ONNX 轉換（第 7 節） |
 | `test_dynamic_usage.py` | 8 | 手動使用動態層，以及對含動態層模型的拒絕（第 6 節） |
 | `test_docs.py` | 4 | 文件中的 Python 範例都能執行（中文與英文版） |
@@ -215,6 +215,12 @@ flowchart TD
 | 模型轉成 `.double()` 或 `.half()` 後，base `export()` 回到 float32 | 匯出的權重被靜默捨入成 float32 | `load_state_dict(..., assign=True)`，不在 state_dict 的 buffer 也跟隨模型；`test_module_conversions_work`、`test_export_keeps_dtype_of_non_persistent_buffers` |
 | 深度增強點 block 內被凍結的 BN 變回訓練模式 | 凍結 BN 的 running 統計值會被更新 | `DepthStack` 只設定自己的旗標；`make_extra` 逐模組還原 |
 | 深度增強的原型以手寫開關實作 | 實驗結果無法代表套件行為 | 改為套件 API（`depth=`），實驗腳本改用 `examples/cifar_netaug.py --depth` |
+| `binary()` 未固定較低維度的被追蹤廣播張量、`passthrough()` 放行張量邊界的 `clamp`/`clip`、`reshape_like()` 未擋下硬編碼通道的 `view`/`reshape` 與壓縮 1 通道的 `squeeze`/`flatten` | 這些情況下通道未被固定，加寬後執行期形狀錯誤或靜默混亂 | 補齊白名單邊界條件並改為固定對應群組；`test_binary_lower_rank_broadcast_is_fixed`、`test_clamp_with_tensor_bounds_is_fixed`、`test_reshape_hardcoded_and_size1_squeeze_are_fixed` |
+| 寬度與深度併用時，殘差額外 block 歸零的最後一個 BN 在加寬後，新增通道被重設回 1 | 殘差額外 block 只在 base 寬度是恆等函數，在較寬寬度不是 | 記錄被歸零的 BN 路徑，加寬後同步將全部通道歸零；`test_residual_extra_blocks_start_as_identity` |
+| 以全零 `example_inputs` 追蹤無 bias 非殘差 block 時，`make_extra` 誤判為恆等而歸零 BN | 非殘差額外 block 的 base 通道被切斷，真實輸入輸出全 0 | 範例輸出接近 0 時改用正值非零探針測試；`test_zero_example_input_does_not_zero_plain_extra_block` |
+| `BatchNorm(affine=False, track_running_stats=False)` 建構時 `next(old.buffers())` 拋出 `StopIteration` | 無參數無緩衝區的 BN 無法包裝 | 處理無張量情況並正確匯出；`test_batchnorm_no_affine_no_stats` |
+| 預設 dtype 為 float32 時，`export(sizes)` 先以預設 dtype 建立新層再 `.copy_()`，截斷 float64 權重 | 匯出 float64 模型損失精度 | 直接以原層的 `device` 與 `dtype` 建立新層再複製；`test_export_sizes_keeps_float64_precision_under_float32_default` |
+| 匯出以 `out.train(self.training)` 洗掉逐模組 `.training` 旗標、`_plain_layer` 遺失 `requires_grad=False`，且 `SyncBatchNorm` 被換成非同步 `DynamicBatchNorm` | 凍結 BN 變回訓練模式、凍結參數被解凍、DDP 靜默失去跨卡同步 | 匯出逐模組保留 `.training` 與 `requires_grad`；將 `SyncBatchNorm` 改為固定；`test_export_preserves_per_module_training_and_requires_grad`、`test_sync_batchnorm_is_fixed`、`test_depth_export_preserves_per_module_training_and_requires_grad` |
 
 ## 9. 限制
 

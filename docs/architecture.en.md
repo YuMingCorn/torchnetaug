@@ -100,12 +100,12 @@ indices used in base mode = [0..5] ∪ [18..21]
 | Category | Operations | Handling |
 |---|---|---|
 | dense layers | `nn.Conv2d` (`groups=1`), `nn.Linear` (input must be 2D) | The output starts a new group |
-| member layers | `nn.BatchNorm1d/2d/3d`, `nn.SyncBatchNorm`, depthwise `nn.Conv2d` | The output keeps the input's group |
-| element-wise | ReLU, ReLU6, SiLU, GELU, Hardswish, Hardsigmoid, Sigmoid, Tanh, LeakyReLU, ELU, Mish, Dropout, Identity, clamp, and others (modules, `F.*`, `torch.*`, and method calls all count) | Pass through |
+| member layers | `nn.BatchNorm1d/2d/3d`, depthwise `nn.Conv2d` | The output keeps the input's group (`nn.SyncBatchNorm` is fixed so cross-rank sync is never dropped silently) |
+| element-wise | ReLU, ReLU6, SiLU, GELU, Hardswish, Hardsigmoid, Sigmoid, Tanh, LeakyReLU, ELU, Mish, Dropout, Identity, clamp, and others (modules, `F.*`, `torch.*`, and method calls all count; per-channel tensor bounds in `clamp`/`clip` fix the touched groups) | Pass through |
 | spatial | MaxPool, AvgPool, AdaptiveAvg/MaxPool, Upsample, `F.interpolate`, torchvision `stochastic_depth` | Pass through |
-| add, multiply | `+`, `-`, `*`, `/`, `torch.add`, and others | Merge the groups of both sides. A tensor with only 1 channel (for example spatial attention `x * sigmoid(conv(x))`, where the conv has `out_channels=1`) broadcasts along the channels and does not take part in the merge. But its group is **fixed** at 1 channel and is not widened |
+| add, multiply | `+`, `-`, `*`, `/`, `torch.add`, and others | Merge the groups of both sides. A tensor with only 1 channel (for example spatial attention `x * sigmoid(conv(x))`, where the conv has `out_channels=1`) broadcasts along the channels and does not take part in the merge, but its group is **fixed** at 1 channel; a lower-rank tracked tensor broadcast onto spatial dimensions is fixed as well |
 | concatenation | `torch.cat` | `dim=1` concatenates segment lists; `dim>=2` merges groups |
-| reshape | `flatten`, `view`, `reshape`, `squeeze`, `nn.Flatten` | Pass through only when dimensions 0 and 1 stay unchanged (for example flatten after pooling) |
+| reshape | `flatten`, `view`, `reshape`, `squeeze`, `nn.Flatten` | Pass through only when dimensions 0 and 1 stay dynamically unchanged at every width (hardcoded channel sizes or squeezing/flattening dim 0/1 fix the group) |
 | reduction | `mean`, `sum`, `amax` | Pass through only when dimensions 0 and 1 are not reduced |
 | metadata reads | `x.size()`, `x.dim()`, `x.shape` | Ignored |
 
@@ -369,7 +369,7 @@ DepthStack.forward(x):
 ```
 
 - Before building, it runs the block once on the example input. It checks that the block is called only once, and that the output shape equals the input shape. The copies read the block's output, so the two shapes must be the same.
-- The weights of the copies are re-initialized (`reset_parameters()`). Then it tries to set the weight and bias of the last BN in each copy to 0. If this makes the copy an identity function on the example input (a residual block), the zeros are kept. Otherwise (a non-residual block, where zeros would cut the signal), it uses the normal re-initialization.
+- The weights of the copies are re-initialized (`reset_parameters()`). Then it tries to set the weight and bias of the last BN in each copy to 0. If this makes the copy an identity function on the example input (or a positive non-zero probe when the example output is near zero, so a plain block is never mistaken for a residual one), the zeros are kept and also applied to all widened channels after widening. Otherwise (a non-residual block, where zeros would cut the signal), it uses the normal re-initialization.
 - All later analysis, widening, and sorting work on this copy that contains `DepthStack` (during tracing, `active` is at its maximum, so the analysis sees all extra blocks). A separate copy of the original model is kept for `export()`.
 
 ### 7.2 Why `tie_channels` is needed

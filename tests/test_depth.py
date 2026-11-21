@@ -23,7 +23,7 @@ import torchvision
 from conftest import assert_sorted, randomize
 from test_widths import BASE_WIDTHS, TinyResNet
 
-from torchnetaug import DepthStack, NetAugModel, netaug_step, recalibrate_bn
+from torchnetaug import DepthStack, DynamicConv2d, DynamicLinear, NetAugModel, netaug_step, recalibrate_bn
 
 
 class Block(nn.Sequential):
@@ -106,9 +106,15 @@ def test_residual_extra_blocks_start_as_identity(case):
     torch.manual_seed(0)
     model = factory().eval()  # default init: extra blocks are new, base weights untouched
     netaug = NetAugModel(model, _x(), depth=depth).eval()
+    x = _x()
     netaug.set_depths(netaug.max_depths)
     with torch.no_grad():
-        torch.testing.assert_close(netaug(_x()), model(_x()), rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(netaug(x), model(x), rtol=1e-6, atol=1e-6)
+        # Identity initialization must hold at wider widths too (not only the base slice).
+        netaug.set_state((netaug.max_sizes, netaug.base_depths, "custom"))
+        at_max_base_depth = netaug(x)
+        netaug.set_max()
+        torch.testing.assert_close(netaug(x), at_max_base_depth, rtol=1e-6, atol=1e-6)
 
 
 def test_sequential_subclass_is_one_block():
@@ -125,6 +131,39 @@ def test_plain_extra_blocks_are_not_zeroed():
     extra = netaug.model.body[1].extra[0]
     assert isinstance(netaug.model.body[1], DepthStack)
     assert extra[1].weight.abs().min() > 0  # zeroing would cut the signal of a plain block
+
+
+def test_zero_example_input_does_not_zero_plain_extra_block():
+    """Tracing with torch.zeros must not mistake a bias-free plain block for a residual block."""
+    class BiasFreePlain(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stem = nn.Sequential(nn.Conv2d(3, 8, 3, padding=1, bias=False), nn.BatchNorm2d(8), nn.ReLU())
+            self.body = nn.Sequential(Block(8), Block(8))
+            self.fc = nn.Linear(8, 4)
+
+        def forward(self, x):
+            return self.fc(self.body(self.stem(x)).mean((2, 3)))
+
+    zeros = torch.zeros(1, 3, 16, 16)
+    plain = NetAugModel(BiasFreePlain().eval(), zeros, width_mults=(1.0, 2.0), depth={"body": 1}).eval()
+    extra_bn = plain.model.body[1].extra[0][1]
+    assert extra_bn.weight.abs().min() > 0
+    plain.set_depths({"body.1": 1})
+    with torch.no_grad():
+        assert plain.model.body(plain.model.stem(_x())).abs().max() > 0
+
+    # Residual blocks traced with zeros still start as identity at both base and max widths.
+    res_base = TinyResNet(BASE_WIDTHS).eval()
+    res = NetAugModel(res_base, torch.zeros(1, 3, 32, 32), depth={"layers.1": 1, "layers.5": 1}).eval()
+    x = _x()
+    with torch.no_grad():
+        res.set_depths(res.max_depths)
+        torch.testing.assert_close(res(x), res_base(x), rtol=1e-6, atol=1e-6)
+        res.set_state((res.max_sizes, res.base_depths, "custom"))
+        at_max_d0 = res(x)
+        res.set_max()
+        torch.testing.assert_close(res(x), at_max_d0, rtol=1e-6, atol=1e-6)
 
 
 def _max_width_outputs(netaug, x):
@@ -410,3 +449,102 @@ def test_export_converts_every_alias_of_a_non_persistent_buffer():
         netaug.model.s.f.t2.add_(5.0)
         exported = netaug.export().eval()
         torch.testing.assert_close(exported(x.double()), netaug(x.double()), rtol=0, atol=0)
+
+
+def test_depth_export_preserves_per_module_training_and_requires_grad():
+    """Depth-augmented exports keep frozen BN flags and requires_grad on block and extras."""
+    model = TinyResNet(BASE_WIDTHS).train()
+    model.get_submodule("layers.1.bn1").eval()
+    model.get_submodule("layers.1.conv1").weight.requires_grad_(False)
+    netaug = NetAugModel(model, _x(), width_mults=(1.0, 2.0), depth={"layers.1": 1})
+
+    exp_base = netaug.export()
+    assert not exp_base.get_submodule("layers.1.bn1").training
+    assert exp_base.get_submodule("layers.1.bn2").training
+    assert not exp_base.get_submodule("layers.1.conv1").weight.requires_grad
+
+    exp_deep = netaug.export(netaug.max_sizes, netaug.max_depths)
+    assert not exp_deep.get_submodule("layers.1.0.bn1").training
+    assert not exp_deep.get_submodule("layers.1.1.bn1").training
+    assert exp_deep.get_submodule("layers.1.0.bn2").training
+    assert not exp_deep.get_submodule("layers.1.0.conv1").weight.requires_grad
+    assert not exp_deep.get_submodule("layers.1.1.conv1").weight.requires_grad
+
+
+def _pull_back(layer, attr, grad):
+    p = getattr(layer, attr)
+    with torch.enable_grad():
+        if isinstance(layer, (DynamicConv2d, DynamicLinear)):
+            sliced = layer.active_weight() if attr == "weight" else layer.active_bias()
+        else:
+            sliced = layer._select_in(p, 0)
+        (full,) = torch.autograd.grad(sliced, p, grad_outputs=grad)
+    return full
+
+
+def _to_model_name(name: str, depths: dict) -> str:
+    for p, d in depths.items():
+        if d == 0:
+            if name == p or name.startswith(p + "."):
+                return p + ".block" + name[len(p):]
+        elif name.startswith(p + "."):
+            idx_str, _, rest = name[len(p) + 1:].partition(".")
+            idx = int(idx_str)
+            sub = "block" if idx == 0 else f"extra.{idx - 1}"
+            return f"{p}.{sub}" + (f".{rest}" if rest else "")
+    return name
+
+
+@pytest.mark.parametrize("case", ["tiny_resnet", "plain_stack"])
+def test_netaug_step_gradient_is_paper_eq2_with_depth(case):
+    """With width + depth combined, netaug_step equals dL(base)/dW + alpha * dL(aug)/dW."""
+    _, netaug = _make(case)
+    with torch.no_grad():
+        for p in netaug._depth_paths:
+            randomize(netaug.model.get_submodule(p).extra, seed=11)
+    netaug.train()
+    x = _x()
+    alpha = 0.6
+    n_classes = netaug(x).shape[1]
+    target = torch.randint(0, n_classes, (x.shape[0],), generator=torch.Generator().manual_seed(2))
+    crit = nn.CrossEntropyLoss()
+
+    # Pick a seed that activates both widening and at least one extra block.
+    seed = next(
+        s for s in range(200)
+        if (
+            netaug.set_random(random.Random(s)),
+            netaug.active_sizes != netaug.base_sizes and any(d > 0 for d in netaug.active_depths.values()),
+        )[1]
+    )
+    sizes, depths = list(netaug.active_sizes), dict(netaug.active_depths)
+    netaug.set_base()
+
+    plain_base = netaug.export().train()
+    plain_aug = netaug.export(sizes, depths).train()
+
+    netaug.zero_grad()
+    netaug_step(netaug, x, target, crit, alpha=alpha, generator=random.Random(seed))
+    crit(plain_base(x), target).backward()
+    (alpha * crit(plain_aug(x), target)).backward()
+
+    expected = {n: torch.zeros_like(p) for n, p in netaug.model.named_parameters()}
+    for st_sizes, st_depths, plain in (
+        (netaug.base_sizes, netaug.base_depths, plain_base),
+        (sizes, depths, plain_aug),
+    ):
+        netaug.set_state((st_sizes, st_depths, "custom"))
+        dynamic = dict(netaug.dynamic_layers())
+        for n, p in plain.named_parameters():
+            if p.grad is None:
+                continue
+            full_name = _to_model_name(n, st_depths)
+            owner, _, attr = full_name.rpartition(".")
+            if owner in dynamic:
+                expected[full_name] += _pull_back(dynamic[owner], attr, p.grad)
+            else:
+                expected[full_name] += p.grad
+    netaug.set_base()
+    for n, p in netaug.model.named_parameters():
+        got = torch.zeros_like(p) if p.grad is None else p.grad
+        torch.testing.assert_close(got, expected[n], atol=1e-9, rtol=1e-7, msg=n)

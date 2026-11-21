@@ -100,12 +100,12 @@ base 模式取的索引 = [0..5] ∪ [18..21]
 | 類別 | 運算 | 處理方式 |
 |---|---|---|
 | dense 層 | `nn.Conv2d`（`groups=1`）、`nn.Linear`（輸入必須是 2D） | 輸出開新群組 |
-| member 層 | `nn.BatchNorm1d/2d/3d`、`nn.SyncBatchNorm`、depthwise `nn.Conv2d` | 輸出沿用輸入的群組 |
-| 逐元素 | ReLU、ReLU6、SiLU、GELU、Hardswish、Hardsigmoid、Sigmoid、Tanh、LeakyReLU、ELU、Mish、Dropout、Identity、clamp 等（模組、`F.*`、`torch.*`、方法呼叫都算） | 穿透 |
+| member 層 | `nn.BatchNorm1d/2d/3d`、depthwise `nn.Conv2d` | 輸出沿用輸入的群組（`nn.SyncBatchNorm` 會被固定，避免靜默失去跨卡同步） |
+| 逐元素 | ReLU、ReLU6、SiLU、GELU、Hardswish、Hardsigmoid、Sigmoid、Tanh、LeakyReLU、ELU、Mish、Dropout、Identity、clamp 等（模組、`F.*`、`torch.*`、方法呼叫都算；`clamp`/`clip` 的逐通道張量邊界會固定該群組） | 穿透 |
 | 空間運算 | MaxPool、AvgPool、AdaptiveAvg/MaxPool、Upsample、`F.interpolate`、torchvision `stochastic_depth` | 穿透 |
-| 相加、相乘 | `+`、`-`、`*`、`/`、`torch.add` 等 | 合併兩邊的群組。只有 1 個通道的張量（例如空間注意力 `x * sigmoid(conv(x))`，其中 conv 的 `out_channels=1`）沿通道廣播，不參與合併，但它的群組會被**固定**在 1 個通道，不會被加寬 |
+| 相加、相乘 | `+`、`-`、`*`、`/`、`torch.add` 等 | 合併兩邊的群組。只有 1 個通道的張量（例如空間注意力 `x * sigmoid(conv(x))`，其中 conv 的 `out_channels=1`）沿通道廣播，不參與合併，但它的群組會被**固定**在 1 個通道；較低維度、對齊到空間維度的被追蹤張量也會固定 |
 | 串接 | `torch.cat` | `dim=1` 串接段列表；`dim>=2` 合併群組 |
-| 改形狀 | `flatten`、`view`、`reshape`、`squeeze`、`nn.Flatten` | 只在第 0、1 維都不變時穿透（例如池化後的 flatten） |
+| 改形狀 | `flatten`、`view`、`reshape`、`squeeze`、`nn.Flatten` | 只在第 0、1 維在任意寬度下都動態保持不變時穿透（硬編碼通道數或對第 0/1 維做 `squeeze`/`flatten` 會固定） |
 | 縮減 | `mean`、`sum`、`amax` | 只在不縮減第 0、1 維時穿透 |
 | 讀取中繼資料 | `x.size()`、`x.dim()`、`x.shape` | 忽略 |
 
@@ -369,7 +369,7 @@ DepthStack.forward(x):
 ```
 
 - 建立前用範例輸入執行一次，檢查該 block 只被呼叫一次，而且輸出形狀等於輸入形狀。副本讀的是 block 的輸出，所以兩者形狀必須相同。
-- 副本的權重重新初始化（`reset_parameters()`）。接著試著把副本最後一個 BN 的 weight 與 bias 設為 0：若副本在範例輸入上因此變成恆等函數（殘差 block），就保留；否則（非殘差 block，歸零會切斷訊號）改用一般的重新初始化。
+- 副本的權重重新初始化（`reset_parameters()`）。接著試著把副本最後一個 BN 的 weight 與 bias 設為 0：若副本在範例輸入（若範例輸出接近 0，改用正值探針避免把非殘差 block 誤判為恆等）上因此變成恆等函數（殘差 block），就保留，且加寬後的新增通道也同步維持為 0；否則（非殘差 block，歸零會切斷訊號）改用一般的重新初始化。
 - 之後的分析、加寬、排序都在這個含 `DepthStack` 的副本上進行（追蹤時 `active` 為最大值，所以分析看得到所有額外 block）。原始模型的副本另外保存，用於 `export()`。
 
 ### 7.2 為什麼需要 `tie_channels`
