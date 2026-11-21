@@ -21,7 +21,7 @@ Users do not build :class:`DepthStack` by hand: pass ``depth={...}`` to ``NetAug
 from __future__ import annotations
 
 import copy
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.fx as fx
@@ -60,7 +60,9 @@ class DepthStack(nn.Module):
         """The active part as plain modules: ``block`` alone, or ``nn.Sequential``."""
         if self.active == 0:
             return self.block
-        return nn.Sequential(self.block, *list(self.extra)[: self.active])
+        seq = nn.Sequential(self.block, *list(self.extra)[: self.active])
+        seq.training = self.training
+        return seq
 
 
 def _reset(module: nn.Module) -> None:
@@ -72,31 +74,43 @@ def _reset(module: nn.Module) -> None:
 
 
 @torch.no_grad()
-def make_extra(block: nn.Module, example: Optional[torch.Tensor]) -> nn.Module:
+def make_extra(block: nn.Module, example: Optional[torch.Tensor]) -> Tuple[nn.Module, Optional[str]]:
     """A copy of ``block`` with new weights; identity at start when ``block`` is residual.
 
     The last batch norm of the copy gets weight 0. If the copy then returns its input
-    unchanged on ``example`` (in eval mode), it is a residual block and the copy is kept.
-    Otherwise the zeroed norm would cut the signal, so a plain re-initialized copy is used.
+    unchanged on ``example`` (or a positive non-zero probe when ``example`` is near zero,
+    so a zero input cannot mistake a plain block for a residual one), it is a residual
+    block and the copy is kept. Otherwise a plain re-initialized copy is used.
+
+    Returns ``(extra, zeroed_bn_path)`` where ``zeroed_bn_path`` is the relative module
+    name of the zeroed BN (or ``None`` when the copy was not zeroed).
     """
     extra = copy.deepcopy(block)
     _reset(extra)
-    norms = [m for m in extra.modules()
+    norms = [(n, m) for n, m in extra.named_modules()
              if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.affine]
-    if not norms or example is None:
-        return extra
+    if not norms or example is None or example.numel() == 0:
+        return extra, None
+    probe = example
+    if probe.abs().max().item() < 1e-3:
+        # A zero input (e.g. tracing with torch.zeros) cannot distinguish f(x)=x from f(x)=0.
+        # Use a positive probe so post-ReLU residual blocks (BasicBlock) still pass f(x)=x.
+        g = torch.Generator(device="cpu").manual_seed(0)
+        probe = torch.rand(example.shape, generator=g, dtype=torch.float32).to(
+            device=example.device, dtype=example.dtype
+        ) + 0.5
     candidate = copy.deepcopy(extra)
-    last = [m for m in candidate.modules()
-            if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.affine][-1]
+    last_name, last = [(n, m) for n, m in candidate.named_modules()
+                       if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.affine][-1]
     last.weight.zero_()
     last.bias.zero_()
     flags = [(m, m.training) for m in candidate.modules()]  # keep per-module flags
     candidate.eval()
-    out: Any = candidate(example)
+    out: Any = candidate(probe)
     for m, flag in flags:
         m.training = flag
-    if isinstance(out, torch.Tensor) and out.shape == example.shape and torch.allclose(
-        out.float(), example.float(), rtol=1e-5, atol=1e-6
+    if isinstance(out, torch.Tensor) and out.shape == probe.shape and torch.allclose(
+        out.float(), probe.float(), rtol=1e-5, atol=1e-6
     ):
-        return candidate
-    return extra
+        return candidate, last_name
+    return extra, None

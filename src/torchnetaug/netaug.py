@@ -42,8 +42,14 @@ def _set_submodule(root: nn.Module, name: str, new: nn.Module) -> None:
 
 
 @torch.no_grad()
-def _add_depth(work: nn.Module, model: nn.Module, example_inputs: Any, depth: Mapping[str, int]) -> List[str]:
-    """Replace each chosen block of ``work`` by a :class:`DepthStack`; return the paths."""
+def _add_depth(
+    work: nn.Module, example_inputs: Any, depth: Mapping[str, int]
+) -> Tuple[List[str], List[str]]:
+    """Replace each chosen block of ``work`` by a :class:`DepthStack`.
+
+    Returns ``(depth_paths, zeroed_bn_paths)`` where ``zeroed_bn_paths`` lists every BN
+    that :func:`make_extra` zero-initialized so widening keeps all its channels at zero.
+    """
     paths: Dict[str, int] = {}
     for path, k in depth.items():
         try:
@@ -84,6 +90,7 @@ def _add_depth(work: nn.Module, model: nn.Module, example_inputs: Any, depth: Ma
             h.remove()
         for m, flag in flags:
             m.training = flag
+    zeroed_bns: List[str] = []
     for p, k in paths.items():
         calls = seen[p]
         if len(calls) != 1:
@@ -97,10 +104,16 @@ def _add_depth(work: nn.Module, model: nn.Module, example_inputs: Any, depth: Ma
                 "only shape-preserving blocks can be repeated"
             )
         block = work.get_submodule(p)
-        stack = DepthStack(block, [make_extra(block, out) for _ in range(k)])
+        extras = []
+        for i in range(k):
+            extra, zero_rel = make_extra(block, out)
+            extras.append(extra)
+            if zero_rel is not None:
+                zeroed_bns.append(f"{p}.extra.{i}.{zero_rel}" if zero_rel else f"{p}.extra.{i}")
+        stack = DepthStack(block, extras)
         stack.training = block.training  # only the wrapper: keep the flags inside the block
         _set_submodule(work, p, stack)
-    return sorted(paths)
+    return sorted(paths), zeroed_bns
 
 
 class NetAugModel(nn.Module):
@@ -148,12 +161,13 @@ class NetAugModel(nn.Module):
             raise ValueError("width_mults must contain 1.0 as its smallest value")
         work = copy.deepcopy(model)
         self._depth_paths: List[str] = []
+        zeroed_bns: List[str] = []
         if depth:
             if graph is not None:
                 raise ValueError("depth cannot be combined with a pre-built graph")
             if example_inputs is None:
                 raise ValueError("example_inputs is required for depth augmentation")
-            self._depth_paths = _add_depth(work, model, example_inputs, depth)
+            self._depth_paths, zeroed_bns = _add_depth(work, example_inputs, depth)
         if graph is None:
             if example_inputs is None:
                 raise ValueError("example_inputs is required when graph is not given")
@@ -188,6 +202,14 @@ class NetAugModel(nn.Module):
             self._in_offsets[name] = offsets
             old = self.model.get_submodule(name)
             _set_submodule(self.model, name, self._widen(name, old))
+        # Keep residual extra blocks as the identity across *every* widened channel, not just base.
+        with torch.no_grad():
+            for bn_path in zeroed_bns:
+                bn = self.model.get_submodule(bn_path)
+                if getattr(bn, "weight", None) is not None:
+                    bn.weight.zero_()
+                if getattr(bn, "bias", None) is not None:
+                    bn.bias.zero_()
 
         self.mode = "base"
         self.active_sizes: List[int] = list(self.base_sizes)
@@ -196,7 +218,7 @@ class NetAugModel(nn.Module):
     # ------------------------------------------------------------------------------
     # construction
     # ------------------------------------------------------------------------------
-    def _base_in_index(self, name: str, device: torch.device) -> torch.Tensor:
+    def _base_in_index(self, name: str, device: Optional[torch.device]) -> torch.Tensor:
         role = self.graph.layers[name]
         segs = [(o, self.base_sizes[g]) for o, g in zip(self._in_offsets[name], role.in_groups)]
         return segments_index(tuple(segs), device)
@@ -207,9 +229,9 @@ class NetAugModel(nn.Module):
         in_max = sum(self.max_sizes[g] for g in role.in_groups)
         p = next(old.parameters(), None)
         if p is None:
-            p = next(old.buffers())
-        fk = {"device": p.device, "dtype": p.dtype}
-        idx = self._base_in_index(name, p.device)
+            p = next((b for b in old.buffers() if b.is_floating_point()), None)
+        fk = {"device": p.device, "dtype": p.dtype} if p is not None else {}
+        idx = self._base_in_index(name, p.device if p is not None else None)
 
         if isinstance(old, nn.Conv2d):
             common = dict(kernel_size=old.kernel_size, stride=old.stride, padding=old.padding,
@@ -454,7 +476,18 @@ class NetAugModel(nn.Module):
         p = next(self.model.parameters(), None)
         if p is not None:
             out.to(p.device)
+        # preserve per-module requires_grad and training flags (e.g. frozen BN / weights)
+        model_params = {self._template_name(k): param
+                        for k, param in self.model.named_parameters(remove_duplicate=False)}
+        for name, param in out.named_parameters(remove_duplicate=False):
+            src = model_params.get(name)
+            if src is not None:
+                param.requires_grad_(src.requires_grad)
         out.train(self.training)
+        for name, mod in self.model.named_modules(remove_duplicate=False):
+            tname = self._template_name(name)
+            if tname is not None:
+                out.get_submodule(tname).training = mod.training
         return out
 
     def _template_name(self, name: str) -> Optional[str]:
@@ -493,7 +526,6 @@ class NetAugModel(nn.Module):
                 _set_submodule(out, p, out.get_submodule(p).to_plain())
         finally:
             self.set_state(previous)
-        out.train(self.training)
         return out
 
     def _plain_layer(self, name: str, layer: DynamicModule) -> nn.Module:
@@ -502,18 +534,26 @@ class NetAugModel(nn.Module):
         n_in = layer.active_in
         tensors = list(layer.parameters()) + list(layer.buffers())
         device = tensors[0].device if tensors else torch.device("cpu")
-        dtype = tensors[0].dtype if tensors else None
+        fp = next((t for t in tensors if t.is_floating_point()), None)
+        dtype = fp.dtype if fp is not None else None
+        fk = {"device": device, "dtype": dtype}
         with torch.no_grad():
             if isinstance(layer, DynamicConv2d):
                 n_out = n_in if layer.depthwise else layer.active_out
                 new = cls(n_in, n_out, layer.kernel_size, layer.stride, layer.padding, layer.dilation,
                           groups=n_in if layer.depthwise else 1, bias=layer.bias is not None,
-                          padding_mode=layer.padding_mode)
+                          padding_mode=layer.padding_mode, **fk)
+                new.weight.copy_(layer.active_weight())
+                if layer.bias is not None:
+                    new.bias.copy_(layer.active_bias())
             elif isinstance(layer, DynamicLinear):
-                new = cls(n_in, layer.active_out, bias=layer.bias is not None)
+                new = cls(n_in, layer.active_out, bias=layer.bias is not None, **fk)
+                new.weight.copy_(layer.active_weight())
+                if layer.bias is not None:
+                    new.bias.copy_(layer.active_bias())
             else:
                 new = cls(n_in, eps=layer.eps, momentum=layer.momentum, affine=layer.affine,
-                          track_running_stats=layer.track_running_stats)
+                          track_running_stats=layer.track_running_stats, **fk)
                 for attr in ("running_mean", "running_var"):
                     if getattr(layer, attr) is not None:
                         getattr(new, attr).copy_(layer._select_in(getattr(layer, attr), 0))
@@ -522,11 +562,10 @@ class NetAugModel(nn.Module):
                 if layer.affine:
                     new.weight.copy_(layer._select_in(layer.weight, 0))
                     new.bias.copy_(layer._select_in(layer.bias, 0))
-                return new.to(device=device, dtype=dtype)
-            new.weight.copy_(layer.active_weight())
-            if layer.bias is not None:
-                new.bias.copy_(layer.active_bias())
-        return new.to(device=device, dtype=dtype)
+        for (_, p_old), (_, p_new) in zip(layer.named_parameters(), new.named_parameters()):
+            p_new.requires_grad_(p_old.requires_grad)
+        new.train(layer.training)
+        return new
 
     # ------------------------------------------------------------------------------
     # channel sorting

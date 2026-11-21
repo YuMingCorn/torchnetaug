@@ -224,10 +224,19 @@ class _Analyzer:
             and src_shape is not None and len(shape) >= 2 and len(src_shape) >= 2
             and shape[0] == src_shape[0] and shape[1] == src_shape[1]
         ):
-            self.spec[node] = self.spec[src]
             for other in node.all_input_nodes:
-                if other is not src and other in self.spec:
-                    self.fix(self.spec[other], f"extra tensor input of {node.name}")
+                if other is src:
+                    continue
+                other_shape = _shape(other)
+                if other_shape is None:
+                    continue  # non-tensor argument (e.g. int size in interpolate)
+                ch_dim = 1 - (len(shape) - len(other_shape))
+                if ch_dim < 0 or other_shape[ch_dim] == 1:
+                    if other in self.spec and (ch_dim != 1 or shape[1] != 1):
+                        self.fix(self.spec[other], f"extra tensor input of {node.name}")
+                else:
+                    return self.opaque(node, f"channel-wise extra tensor input of {node.name}")
+            self.spec[node] = self.spec[src]
         else:
             self.opaque(node, f"channel count changed at {node.name}")
 
@@ -302,19 +311,128 @@ class _Analyzer:
             self.layers[name] = LayerRole("dense", in_spec, g)
             self.spec[node] = (g,)
         else:  # batch norm
-            if c_in != mod.num_features or not isinstance(
-                mod, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)
+            if c_in != mod.num_features or type(mod) not in (
+                nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
             ):
                 return self.opaque(node, f"unsupported norm {name}")
             self.layers[name] = LayerRole("member", in_spec)
             self.spec[node] = in_spec
 
+    @staticmethod
+    def _dim_read(arg: Any) -> Optional[Tuple[fx.Node, int]]:
+        """If ``arg`` reads one dimension ``d`` of a tensor node ``src``, return ``(src, d)``."""
+        if not isinstance(arg, fx.Node):
+            return None
+        if arg.op == "call_method" and arg.target == "size":
+            src = arg.args[0] if arg.args else None
+            dim = arg.args[1] if len(arg.args) > 1 else arg.kwargs.get("dim")
+            if isinstance(src, fx.Node) and isinstance(dim, int) and not isinstance(dim, bool):
+                src_s = _shape(src)
+                if src_s is not None and -len(src_s) <= dim < len(src_s):
+                    return src, dim % len(src_s)
+            return None
+        if arg.op == "call_function" and arg.target is operator.getitem and len(arg.args) == 2:
+            seq, idx = arg.args
+            if not (isinstance(seq, fx.Node) and isinstance(idx, int) and not isinstance(idx, bool)):
+                return None
+            src = None
+            if seq.op == "call_function" and seq.target is getattr and len(seq.args) == 2 and seq.args[1] == "shape":
+                src = seq.args[0]
+            elif seq.op == "call_method" and seq.target == "size" and len(seq.args) == 1 and not seq.kwargs:
+                src = seq.args[0]
+            if isinstance(src, fx.Node):
+                src_s = _shape(src)
+                if src_s is not None and -len(src_s) <= idx < len(src_s):
+                    return src, idx % len(src_s)
+        return None
+
+    def _same_spec(self, a: Spec, b: Spec) -> bool:
+        return len(a) == len(b) and all(self.find(x) == self.find(y) for x, y in zip(a, b))
+
+    def _is_channel_size(self, arg: Any, spec: Spec) -> bool:
+        read = self._dim_read(arg)
+        return read is not None and read[1] == 1 and read[0] in self.spec and self._same_spec(self.spec[read[0]], spec)
+
+    def _is_non_channel_expr(self, arg: Any, depth: int = 0) -> bool:
+        if isinstance(arg, int) and not isinstance(arg, bool):
+            return True
+        if depth > 8 or not isinstance(arg, fx.Node):
+            return False
+        read = self._dim_read(arg)
+        if read is not None:
+            return read[1] != 1
+        if arg.op == "call_function" and arg.target in (
+            operator.mul, operator.floordiv, operator.add, operator.sub,
+        ) and not arg.kwargs:
+            return all(self._is_non_channel_expr(a, depth + 1) for a in arg.args)
+        return False
+
+    def _reshape_preserves_channels(self, node: fx.Node, x: fx.Node, s: torch.Size, o: torch.Size) -> bool:
+        """True only when the reshape keeps dim 1 == C dynamically for *any* active width."""
+        t = node.target
+        if node.op == "call_module":
+            mod = self.modules[t]
+            if type(mod) is not nn.Flatten:
+                return False
+            start, end = mod.start_dim % len(s), mod.end_dim % len(s)
+            return start <= end and (start >= 2 or (start == 1 and math.prod(s[2 : end + 1]) == 1))
+        if (node.op == "call_function" and t is torch.flatten) or (node.op == "call_method" and t == "flatten"):
+            start_dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("start_dim", 0)
+            end_dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("end_dim", -1)
+            if not (
+                isinstance(start_dim, int) and not isinstance(start_dim, bool)
+                and isinstance(end_dim, int) and not isinstance(end_dim, bool)
+            ):
+                return False
+            start, end = start_dim % len(s), end_dim % len(s)
+            return start <= end and (start >= 2 or (start == 1 and math.prod(s[2 : end + 1]) == 1))
+        if (node.op == "call_function" and t is torch.squeeze) or (node.op == "call_method" and t == "squeeze"):
+            dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", None)
+            if dim is None:
+                return s[0] > 1 and s[1] > 1
+            if isinstance(dim, int) and not isinstance(dim, bool):
+                return (dim % len(s)) >= 2
+            if isinstance(dim, (tuple, list)) and all(isinstance(d, int) and not isinstance(d, bool) for d in dim):
+                return all((d % len(s)) >= 2 for d in dim)
+            return False
+        # view / reshape: output dim 1 must adapt to the channel count (-1 or x.size(1)/x.shape[1]),
+        # and no other dimension may depend on a channel dimension.
+        if node.op == "call_function" and t is torch.reshape:
+            raw = node.args[1] if len(node.args) > 1 else node.kwargs.get("shape")
+            if not isinstance(raw, (tuple, list)):
+                return False
+            shape_args = list(raw)
+        else:
+            if node.kwargs:
+                if (
+                    t == "reshape" and set(node.kwargs) == {"shape"} and len(node.args) == 1
+                    and isinstance(node.kwargs["shape"], (tuple, list))
+                ):
+                    shape_args = list(node.kwargs["shape"])
+                else:
+                    return False
+            elif len(node.args) == 2 and isinstance(node.args[1], (tuple, list)):
+                shape_args = list(node.args[1])
+            else:
+                shape_args = list(node.args[1:])
+        if len(shape_args) != len(o):
+            return False
+        dim1 = shape_args[1]
+        dim1_ok = (isinstance(dim1, int) and not isinstance(dim1, bool) and dim1 == -1) or self._is_channel_size(
+            dim1, self.spec[x]
+        )
+        if not dim1_ok:
+            return False
+        return all(self._is_non_channel_expr(a) for i, a in enumerate(shape_args) if i != 1)
+
     def reshape_like(self, node: fx.Node, x: Any) -> None:
-        """Keep the channel groups if dim 0 and dim 1 are unchanged (e.g. flatten after pooling)."""
+        """Keep the channel groups if dim 0 and dim 1 stay dynamically unchanged."""
         s, o = _shape(x), _shape(node)
         if (
-            s is not None and o is not None and len(s) >= 2 and len(o) >= 2
+            isinstance(x, fx.Node) and x in self.spec
+            and s is not None and o is not None and len(s) >= 2 and len(o) >= 2
             and s[0] == o[0] and s[1] == o[1] and math.prod(s[2:]) == math.prod(o[2:])
+            and self._reshape_preserves_channels(node, x, s, o)
         ):
             return self.passthrough(node, x)
         self.opaque(node, f"reshape changes channels at {node.name}")
@@ -331,9 +449,11 @@ class _Analyzer:
         if (not is_method and t in _CAT_FUNCTIONS):
             return self.cat(node)
         if (not is_method and t in _PASSTHROUGH_FUNCTIONS) or (is_method and t in _PASSTHROUGH_METHODS):
-            return self.passthrough(node, node.args[0] if node.args else None)
+            src = node.args[0] if node.args else node.kwargs.get("input")
+            return self.passthrough(node, src)
         if (not is_method and t in _RESHAPE_FUNCTIONS) or (is_method and t in _RESHAPE_METHODS):
-            return self.reshape_like(node, node.args[0])
+            src = node.args[0] if node.args else node.kwargs.get("input")
+            return self.reshape_like(node, src)
         if (not is_method and t in _MEAN_FUNCTIONS) or (is_method and t in _MEAN_METHODS):
             return self.reduce(node)
         if (is_method and t in _METADATA_METHODS) or (not is_method and t is getattr):
@@ -356,10 +476,12 @@ class _Analyzer:
                 continue  # non-tensor value
             ch_dim = 1 - (len(out) - len(s))
             if ch_dim < 0 or s[ch_dim] == 1:
-                # Broadcasts over channels. A 1-channel tensor (e.g. the map of a spatial
-                # attention conv with out_channels=1) must keep exactly 1 channel.
-                if ch_dim == 1 and out[1] != 1 and arg in self.spec:
-                    self.fix(self.spec[arg], f"1-channel tensor broadcast in {node.name}")
+                # Broadcasts over channels:
+                # - A 1-channel tensor at dim 1 (e.g. spatial attention map) must stay 1 channel.
+                # - A lower-rank tracked tensor (ch_dim < 1) aligns its dim 1 with a spatial dim
+                #   of ``out``, so its channel group must stay fixed too.
+                if arg in self.spec and (ch_dim != 1 or out[1] != 1):
+                    self.fix(self.spec[arg], f"broadcast tensor in {node.name}")
                 continue
             if ch_dim != 1 or arg not in self.spec:
                 return self.opaque(node, f"channel-wise constant in {node.name}")
@@ -393,12 +515,17 @@ class _Analyzer:
             self.opaque(node, f"cat along batch dim {node.name}")
 
     def reduce(self, node: fx.Node) -> None:
-        x = node.args[0]
+        x = node.args[0] if node.args else node.kwargs.get("input")
         s = _shape(x)
         dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
         if s is None or dims is None:
             return self.opaque(node, f"full reduction {node.name}")
-        dims = [dims] if isinstance(dims, int) else list(dims)
+        if isinstance(dims, int) and not isinstance(dims, bool):
+            dims = [dims]
+        elif isinstance(dims, (tuple, list)) and all(isinstance(d, int) and not isinstance(d, bool) for d in dims):
+            dims = list(dims)
+        else:
+            return self.opaque(node, f"dynamic reduction {node.name}")
         dims = [d % len(s) for d in dims]
         if 0 in dims or 1 in dims:
             return self.opaque(node, f"reduction over channels {node.name}")
