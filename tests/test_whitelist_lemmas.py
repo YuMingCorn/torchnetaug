@@ -1,4 +1,4 @@
-"""The lemmas that the correctness proof in docs/architecture.md section 5.6 rests on.
+"""The lemmas that the correctness proof in docs/design.md section 5.1 rests on.
 
 The proof needs one property from every operation that lets channels pass through:
 it must be *channel-separable*, i.e. output channel c depends only on input channel c
