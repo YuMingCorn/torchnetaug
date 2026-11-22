@@ -406,3 +406,306 @@ def test_tied_weights_are_rejected():
 
     with pytest.raises(ValueError, match="shared"):
         NetAugModel(Tied(), torch.randn(2, 6))
+
+
+def test_binary_lower_rank_broadcast_is_fixed():
+    """A lower-rank tracked tensor broadcast against spatial dims must stay fixed."""
+    class LowerRank2D(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.fc_bias = nn.Linear(3, 4)
+            self.c2 = nn.Conv2d(8, 6, 3, padding=1)
+            self.head = nn.Linear(6, 2)
+
+        def forward(self, x):
+            a = self.c1(x)
+            b = self.fc_bias(x.mean((2, 3)))  # (1, 4) broadcasts onto spatial dim W=4
+            return self.head(self.c2(a + b).mean((2, 3)))
+
+    class LowerRank3D(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.c_side = nn.Conv2d(3, 4, 3, padding=1)
+            self.c2 = nn.Conv2d(8, 6, 3, padding=1)
+            self.head = nn.Linear(6, 2)
+
+        def forward(self, x):
+            a = self.c1(x)
+            b = self.c_side(x).mean(3)  # (1, 4, 4) broadcasts onto (H, W)=(4, 4)
+            return self.head(self.c2(a + b).mean((2, 3)))
+
+    x = example_input(batch=1, size=4)
+    for cls, fixed_layer in ((LowerRank2D, "fc_bias"), (LowerRank3D, "c_side")):
+        base = randomize(cls()).eval()
+        aug = NetAugModel(base, x, width_mults=(1.0, 2.0)).eval()
+        assert aug.graph.group_fixed[aug.graph.layers[fixed_layer].out_group]
+        assert not aug.graph.group_fixed[aug.graph.layers["c1"].out_group]
+        torch.testing.assert_close(aug(x), base(x), atol=ATOL, rtol=0)
+        randomize(aug, seed=9)
+        aug.set_max()
+        before = aug(x)
+        aug.sort_channels()
+        torch.testing.assert_close(aug(x), before, atol=1e-8, rtol=1e-8)
+
+
+def test_clamp_with_tensor_bounds_is_fixed():
+    """torch.clamp with per-channel tensor/Parameter bounds must fix the touched groups."""
+    class ClampParam(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.low = nn.Parameter(torch.randn(1, 8, 1, 1))
+            self.c2 = nn.Conv2d(8, 6, 1)
+            self.fc = nn.Linear(6, 2)
+
+        def forward(self, x):
+            y = torch.clamp(self.c1(x), min=self.low)
+            return self.fc(self.c2(y).mean((2, 3)))
+
+    class ClampTracked(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.c2 = nn.Conv2d(3, 8, 3, padding=1)
+            self.c3 = nn.Conv2d(8, 6, 1)
+            self.fc = nn.Linear(6, 2)
+
+        def forward(self, x):
+            y = torch.clamp(self.c1(x), min=self.c2(x))
+            return self.fc(self.c3(y).mean((2, 3)))
+
+    class ClampScalar(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.c2 = nn.Conv2d(8, 6, 1)
+            self.fc = nn.Linear(6, 2)
+
+        def forward(self, x):
+            y = torch.clamp(self.c1(x), min=0.0, max=6.0)
+            return self.fc(self.c2(y).mean((2, 3)))
+
+    x = example_input(batch=2, size=8)
+    for cls, fixed_names in ((ClampParam, ("c1",)), (ClampTracked, ("c1", "c2"))):
+        base = randomize(cls()).eval()
+        aug = NetAugModel(base, x, width_mults=(1.0, 2.0)).eval()
+        for name in fixed_names:
+            assert aug.graph.group_fixed[aug.graph.layers[name].out_group]
+        torch.testing.assert_close(aug(x), base(x), atol=ATOL, rtol=0)
+        randomize(aug, seed=9)
+        aug.set_max()
+        before = aug(x)
+        aug.sort_channels()
+        torch.testing.assert_close(aug(x), before, atol=1e-8, rtol=1e-8)
+
+    aug_scalar = NetAugModel(randomize(ClampScalar()).eval(), x, width_mults=(1.0, 2.0)).eval()
+    assert not aug_scalar.graph.group_fixed[aug_scalar.graph.layers["c1"].out_group]
+
+
+def test_reshape_hardcoded_and_size1_squeeze_are_fixed():
+    """Hardcoded channel sizes in view/reshape and squeezing/flattening dim 1 must fix C."""
+    class HardcodedView(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.fc = nn.Linear(8, 4)
+
+        def forward(self, x):
+            return self.fc(self.c1(x).mean((2, 3)).view(x.size(0), 8))
+
+    class HardcodedMixView(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.fc = nn.Linear(8, 4)
+
+        def forward(self, x):
+            y = self.c1(x).view(x.size(0), 8, -1)
+            return self.fc(y.mean(2))
+
+    class HardcodedBatchView(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.fc = nn.Linear(8, 4)
+
+        def forward(self, x):
+            return self.fc(self.c1(x).mean((2, 3)).view(-1, 8))
+
+    class SqueezeCh1(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 1, 3, padding=1)
+            self.pool = nn.AdaptiveAvgPool2d((1, 4))
+            self.fc = nn.Linear(1, 4)
+
+        def forward(self, x):
+            y = self.pool(self.c1(x)).squeeze(1)
+            return self.fc(y.mean(2))
+
+    class Flatten01Ch1(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 1, 3, padding=1)
+            self.pool = nn.AdaptiveAvgPool2d((1, 4))
+            self.fc = nn.Linear(1, 4)
+
+        def forward(self, x):
+            y = torch.flatten(self.pool(self.c1(x)), 0, 1)
+            return self.fc(y.mean(2))
+
+    class DynamicViews(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.c2 = nn.Conv2d(8, 6, 3, padding=1)
+            self.fc = nn.Linear(6, 4)
+
+        def forward(self, x):
+            y = torch.relu(self.c1(x))
+            b, c, h, w = y.shape
+            y = y.reshape(b, c, h * w).view(b, -1, h, w)
+            z = self.c2(y).mean((2, 3), keepdim=True).view(b, -1)
+            return self.fc(z)
+
+    x2 = example_input(batch=2, size=8)
+    for cls, inp in (
+        (HardcodedView, x2),
+        (HardcodedMixView, x2),
+        (HardcodedBatchView, x2),
+        (SqueezeCh1, x2),
+        (Flatten01Ch1, example_input(batch=1, size=8)),
+    ):
+        base = randomize(cls()).eval()
+        aug = NetAugModel(base, inp, width_mults=(1.0, 2.0)).eval()
+        assert aug.graph.group_fixed[aug.graph.layers["c1"].out_group], cls.__name__
+        aug.set_max()
+        torch.testing.assert_close(aug(inp), base(inp), atol=ATOL, rtol=0)
+
+    dyn_base = randomize(DynamicViews()).eval()
+    dyn_aug = NetAugModel(dyn_base, x2, width_mults=(1.0, 2.0)).eval()
+    assert not dyn_aug.graph.group_fixed[dyn_aug.graph.layers["c1"].out_group]
+    assert not dyn_aug.graph.group_fixed[dyn_aug.graph.layers["c2"].out_group]
+    randomize(dyn_aug, seed=11)
+    dyn_aug.set_max()
+    before = dyn_aug(x2)
+    dyn_aug.sort_channels()
+    torch.testing.assert_close(dyn_aug(x2), before, atol=1e-8, rtol=1e-8)
+
+
+def test_batchnorm_no_affine_no_stats():
+    """BatchNorm(affine=False, track_running_stats=False) has no params or buffers."""
+    class Net(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.bn = nn.BatchNorm2d(8, affine=False, track_running_stats=False)
+            self.fc = nn.Linear(8, 4)
+
+        def forward(self, x):
+            return self.fc(torch.relu(self.bn(self.c1(x))).mean((2, 3)))
+
+    x = example_input(batch=4, size=8)
+    base = randomize(Net())
+    aug = NetAugModel(base, x, width_mults=(1.0, 2.0))
+    assert not aug.graph.group_fixed[aug.graph.layers["c1"].out_group]
+    for train_mode in (False, True):
+        base.train(train_mode), aug.train(train_mode)
+        torch.testing.assert_close(aug(x), base(x), atol=ATOL, rtol=0)
+    randomize(aug, seed=5)
+    aug.eval()
+    aug.set_max()
+    before = aug(x)
+    aug.sort_channels()
+    torch.testing.assert_close(aug(x), before, atol=1e-8, rtol=1e-8)
+    exp_max = aug.export(aug.max_sizes).eval()
+    torch.testing.assert_close(exp_max(x), aug(x), atol=ATOL, rtol=0)
+    recalibrate_bn(aug, [x])
+    aug.set_base()
+    torch.testing.assert_close(aug.export().eval()(x), aug(x), atol=ATOL, rtol=0)
+
+
+def test_sync_batchnorm_is_fixed():
+    """SyncBatchNorm must not be silently replaced by local DynamicBatchNorm."""
+    class Net(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.bn = nn.SyncBatchNorm(8)
+            self.c2 = nn.Conv2d(8, 6, 1)
+            self.fc = nn.Linear(6, 4)
+
+        def forward(self, x):
+            return self.fc(self.c2(torch.relu(self.bn(self.c1(x)))).mean((2, 3)))
+
+    x = example_input(batch=2, size=8)
+    base = randomize(Net()).eval()
+    aug = NetAugModel(base, x, width_mults=(1.0, 2.0)).eval()
+    assert "bn" not in aug.graph.layers
+    assert isinstance(aug.model.bn, nn.SyncBatchNorm)
+    assert aug.graph.group_fixed[aug.graph.layers["c1"].out_group]
+    assert not aug.graph.group_fixed[aug.graph.layers["c2"].out_group]
+    torch.testing.assert_close(aug(x), base(x), atol=ATOL, rtol=0)
+    aug.set_max()
+    aug(x)
+
+
+def test_export_sizes_keeps_float64_precision_under_float32_default():
+    """export(sizes) must not truncate float64 weights through the default float32 dtype."""
+    class Net(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.bn = nn.BatchNorm2d(8)
+            self.fc = nn.Linear(8, 4)
+
+        def forward(self, x):
+            return self.fc(torch.relu(self.bn(self.c1(x))).mean((2, 3)))
+
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    try:
+        base = randomize(Net().double(), seed=2).eval()
+        x = torch.randn(2, 3, 8, 8, dtype=torch.float64, generator=torch.Generator().manual_seed(1))
+        aug = NetAugModel(base, x, width_mults=(1.0, 2.0)).eval()
+        randomize(aug, seed=3)
+        aug.set_max()
+        exported = aug.export(aug.active_sizes).eval()
+        torch.testing.assert_close(exported.c1.weight, aug.model.c1.active_weight(), rtol=0, atol=0)
+        torch.testing.assert_close(exported(x), aug(x), rtol=0, atol=0)
+    finally:
+        torch.set_default_dtype(previous)
+
+
+def test_export_preserves_per_module_training_and_requires_grad():
+    """Both export() and export(sizes) must preserve frozen BN flags and requires_grad."""
+    class Net(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c1 = nn.Conv2d(3, 8, 3, padding=1)
+            self.bn1 = nn.BatchNorm2d(8)
+            self.c2 = nn.Conv2d(8, 6, 3, padding=1)
+            self.bn2 = nn.BatchNorm2d(6)
+            self.fc = nn.Linear(6, 4)
+
+        def forward(self, x):
+            x = torch.relu(self.bn1(self.c1(x)))
+            return self.fc(torch.relu(self.bn2(self.c2(x))).mean((2, 3)))
+
+    x = example_input(batch=2, size=8)
+    base = randomize(Net()).train()
+    base.bn1.eval()
+    base.c1.weight.requires_grad_(False)
+    aug = NetAugModel(base, x, width_mults=(1.0, 2.0))
+    # also freeze a parameter after wrapping
+    aug.model.c2.bias.requires_grad_(False)
+
+    for exported in (aug.export(), aug.export(aug.max_sizes)):
+        assert not exported.bn1.training
+        assert exported.bn2.training
+        assert not exported.c1.weight.requires_grad
+        assert exported.c1.bias.requires_grad
+        assert not exported.c2.bias.requires_grad
+        assert exported.c2.weight.requires_grad

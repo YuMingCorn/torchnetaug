@@ -25,15 +25,15 @@ This report answers four questions. It also records the verification method, the
 
 ## 2. Correctness verification
 
-`uv run pytest` runs 460 tests, and all pass. The tests compare outputs in float64 with tight tolerances. Before each comparison, they randomize all parameters and BN statistics, so default values cannot hide errors.
+`uv run pytest` runs 471 tests, and all pass. The tests compare outputs in float64 with tight tolerances. Before each comparison, they randomize all parameters and BN statistics, so default values cannot hide errors.
 
 | Test file | Count | What it checks |
 |---|---|---|
-| `test_correctness.py` | 104 | base mode equals the original model; export; sorting keeps the max-width function; order after sorting, and sorting is idempotent; optimizer state reordering; the augmented network does not corrupt BN; gradients (including element-wise equality with paper Eq. 2) |
+| `test_correctness.py` | 111 | base mode equals the original model; export (including float64 precision under a float32 default dtype, per-module training flags, and `requires_grad`); sorting keeps the max-width function; order after sorting, and sorting is idempotent; optimizer state reordering; the augmented network does not corrupt BN; gradients (including element-wise equality with paper Eq. 2); whitelist edge guards (lower-rank broadcasts, tensor `clamp`, hardcoded `view`/`squeeze`, parameterless BN, `SyncBatchNorm`) |
 | `test_random_architectures.py` | 61 | The same properties on 60 randomly generated architectures (combinations of residual, concat, depthwise, SE, and others), including order after sorting and idempotence |
 | `test_whitelist_lemmas.py` | 172 | The assumptions of the sorting correctness proof: whitelisted operations act on each channel independently; the permutation lemma for dynamic layers |
 | `test_widths.py` | 55 | At each width, the parameter count, weight shapes, and output equal a plain model built directly at that width |
-| `test_depth.py` | 44 | Depth augmentation (Section 5) |
+| `test_depth.py` | 48 | Depth augmentation (Section 5), including residual identity init across widened channels, zero example-input guard, and width + depth Eq. 2 gradient checks |
 | `test_onnx.py` | 12 | ONNX conversion (Section 7) |
 | `test_dynamic_usage.py` | 8 | Manual use of dynamic layers, and rejection of models that contain dynamic layers (Section 6) |
 | `test_docs.py` | 4 | Every Python example in the documents runs (Chinese and English versions) |
@@ -215,6 +215,12 @@ Another approach is to provide the package's own composition modules (for exampl
 | After `.double()` or `.half()`, the base `export()` fell back to float32 | The exported weights were silently rounded to float32 | `load_state_dict(..., assign=True)`, and buffers outside the state_dict also follow the model; `test_module_conversions_work`, `test_export_keeps_dtype_of_non_persistent_buffers` |
 | Frozen BN inside a depth point block was switched back to training mode | The running statistics of the frozen BN were updated | `DepthStack` sets only its own flag; `make_extra` restores the flag of each module |
 | The depth augmentation prototype used hand-written switches | The experiment results could not represent the package behavior | Changed to the package API (`depth=`); the experiment script is now `examples/cifar_netaug.py --depth` |
+| `binary()` did not fix lower-rank tracked broadcast tensors; `passthrough()` allowed tensor bounds in `clamp`/`clip`; `reshape_like()` missed hardcoded channel sizes in `view`/`reshape` and dim-1 `squeeze`/`flatten` | Touched groups stayed free and crashed or corrupted shapes once widened | Tightened the whitelist guards so those groups stay fixed; `test_binary_lower_rank_broadcast_is_fixed`, `test_clamp_with_tensor_bounds_is_fixed`, `test_reshape_hardcoded_and_size1_squeeze_are_fixed` |
+| With width + depth combined, widening reset the newly added channels of a residual extra block's zeroed last BN back to 1 | Residual extra blocks were identity only at base width, not at wider widths | Track zero-initialized BN paths and zero all widened channels after `_widen()`; `test_residual_extra_blocks_start_as_identity` |
+| Tracing a bias-free non-residual block with all-zero `example_inputs` caused `make_extra` to mistake it for an identity block and zero its BN | The base channels of the non-residual extra block were cut off (zero output on real inputs) | Use a positive non-zero probe when the example output is near zero; `test_zero_example_input_does_not_zero_plain_extra_block` |
+| `BatchNorm(affine=False, track_running_stats=False)` raised `StopIteration` on `next(old.buffers())` | Parameterless, stateless BN layers could not be wrapped | Handle layers with no parameters or buffers in `_widen` and `_plain_layer`; `test_batchnorm_no_affine_no_stats` |
+| Under a float32 default dtype, `export(sizes)` created new layers in float32 before `.copy_()`, truncating float64 weights | Exported float64 models lost precision | Construct plain layers directly with the source layer's `device` and `dtype` before copying; `test_export_sizes_keeps_float64_precision_under_float32_default` |
+| Export overwrote per-module `.training` flags with `out.train(self.training)`, `_plain_layer` dropped `requires_grad=False`, and `SyncBatchNorm` was replaced by local `DynamicBatchNorm` | Frozen BNs switched back to train mode, frozen weights unfroze, and DDP silently lost cross-rank sync | Preserve per-module `.training` and `requires_grad` on export; keep `SyncBatchNorm` fixed; `test_export_preserves_per_module_training_and_requires_grad`, `test_sync_batchnorm_is_fixed`, `test_depth_export_preserves_per_module_training_and_requires_grad` |
 
 ## 9. Limitations
 
