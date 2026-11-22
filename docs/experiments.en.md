@@ -7,10 +7,10 @@ Dates: 2026-11-19 (CIFAR-10), 2026-11-23 (CIFAR-100). For the code design and co
 ## 1. Conclusions
 
 - **In every tested setting, NetAug did not significantly improve the test accuracy of the base model.** On CIFAR-10 the gain is at most +0.34 percentage points, smaller than the seed noise. On CIFAR-100, no NetAug setting has a 95% confidence interval with a lower bound above 0.
-- **The same compute spent on 40 more epochs of training gives +1.54 percentage points (95% CI [+0.85, +2.24]), and this gain is significant.**
+- **A baseline trained for 40 more epochs (about 2 times the compute, still less than the 2.6 times of NetAug in this environment) gains +1.54 percentage points (95% CI [+0.85, +2.24]), and this gain is significant.**
 - The training accuracy often goes up (+0.7 to +1.3 percentage points per seed on CIFAR-10), but this does not turn into test accuracy.
 - Depth augmentation, channel sorting, and the recipe options of the official code did not change the result.
-- Wide models exported from a NetAug model are 1.3 to 15 percentage points below models of the same width trained alone.
+- Wide models exported from a NetAug model are 1.3 to 20 percentage points below models of the same width trained alone.
 - MobileNetV2 (1 seed) trains worse with NetAug. The cause is not known.
 - No implementation error that could make NetAug fail was found. For all exported models, the output difference from the dynamic network is 0.
 
@@ -53,7 +53,7 @@ Observations:
 - The gain of the base is smaller than the standard deviation of the paired difference, and in each method one of the 3 seeds is negative.
 - The training accuracy goes up by 0.7 to 1.3 percentage points for every seed. This agrees with the mechanism "reduce underfitting", but the test accuracy does not go up with it.
 - From ×1.5 up, the exported wide models are 1.3 to 3.2 percentage points lower, and the gap grows with the width. The added channels get gradients only when they are sampled.
-- The gain of the paper (ImageNet, MobileNetV2-Tiny, 150 epochs, +1.6 percentage points) was not reproduced. The dataset, the model and the training length are all different.
+- The gain of the paper (ImageNet, MobileNetV2-Tiny, 150 epochs, +1.6 percentage points) was not reproduced. The dataset, the model and the training length are all different. The official default also stops width augmentation for the last 75 epochs (only the expand ratio is still sampled) and sorts every epoch; this experiment augments for the whole run and sorts every 10 epochs.
 
 ### 3.2 Channel sorting
 
@@ -82,7 +82,7 @@ The effect on CIFAR-10 is small. This section checks why: the setup does not sui
 
 - **An underfitting setup.** CIFAR-100, TinyResNet at base width ×0.25 (2, 4, 8, 16 channels), with a training accuracy of only 33.8%. ×0.5 and ×1 are also tested.
 - **Reading rules fixed in advance.** For the 95% confidence interval (t distribution) of the paired difference: lower bound above 0 means "gain"; upper bound below +0.5 percentage points means "no real gain"; otherwise "inconclusive".
-- **Controls.** lr 0.2 with weight decay 2.5e-4 (NetAug adds two losses, which is like a larger gradient); a baseline trained for 80 epochs (about the compute of NetAug); ×2 and ×3 models trained alone.
+- **Controls.** lr 0.2 with weight decay 2.5e-4 (NetAug adds two losses, which is like a larger gradient); a baseline trained for 80 epochs (2 times the compute, less than the about 2.6 times of NetAug in this environment); ×2 and ×3 models trained alone.
 
 ### 4.2 Base model
 
@@ -119,7 +119,7 @@ The effect on CIFAR-10 is small. This section checks why: the setup does not sui
 | ×0.25, stop augmentation 0.5 | 34.61 | 35.02 | Same as above |
 | ×0.5 | 52.28 | 53.06 | 59.98 (×2) |
 
-- The exported wide models are 7 to 15 percentage points below models of the same width trained alone. When each group samples its own width, the whole ×3 network is almost never sampled. The networks actually sampled in training (19,000 to 92,000 parameters) give 36.97 ± 2.41% on average after export, while a 47,600-parameter model trained alone gives 46.7%.
+- The exported wide models are 7.7 to 20.1 percentage points below models of the same width trained alone. When each group samples its own width, the whole ×3 network is almost never sampled. The networks actually sampled in training (19,000 to 92,000 parameters) give 36.97 ± 2.41% on average after export, while a 47,600-parameter model trained alone gives 46.7%.
 - **Wide-path check**: when the whole network samples ×1 or ×2 together, the exported ×2 gives 41.22 ± 1.56% (n=3). The ×2 network is trained in only about half of the steps, and the after-the-fact control, a ×2 model trained alone for 20 epochs, gives 43.2% (n=3), about 2 percentage points higher. This control was not designed in advance, so the reading is "inconclusive": no clear defect was seen, but the check does not prove that the wide path has no problem.
 
 ### 4.4 Gradients

@@ -6,7 +6,7 @@
 
 ## 結論
 
-本專案用純 PyTorch 實作了 Network Augmentation（NetAug，Cai et al., ICLR 2022），並在 CIFAR-10 與 CIFAR-100 上驗證效果。**實作正確，但 NetAug 在測試過的設定中沒有帶來顯著增益。** 增強網路提供的額外 loss 訊號常讓訓練準確率上升，卻沒有提高 base 模型的測試準確率。把同樣的計算量用在多訓練 40 epoch，效果反而顯著較好。
+本專案用純 PyTorch 實作了 Network Augmentation（NetAug，Cai et al., ICLR 2022），並在 CIFAR-10 與 CIFAR-100 上驗證效果。**測試顯示實作符合論文的定義，也沒有找到實作錯誤；但 NetAug 在測試過的設定中沒有帶來顯著增益。** 增強網路提供的額外 loss 訊號常讓訓練準確率上升，卻沒有提高 base 模型的測試準確率。baseline 多訓練 40 epoch 反而顯著較好；本環境中 NetAug 每步約是 baseline 的 2.6 倍時間，所以這個 baseline 用的計算量仍比 NetAug 少。
 
 ## 完成的工作
 
@@ -34,8 +34,8 @@ base 模型的測試準確率與同 seed baseline 的配對差異（百分點）
 1. **額外的 loss 訊號沒有轉成泛化能力。** 訓練準確率上升（CIFAR-10 每個 seed +0.7 到 +1.3 個百分點），測試準確率沒有。
 2. **增強梯度大致和 base 梯度同方向**（TinyResNet 上 cosine 0.82 到 0.93），NetAug 在這裡的作用接近放大步長。但「只是放大步長」的對照結果是「無法判定」，所以這是推測。
 3. **排序幾乎不會改變 base。** 新增通道的初始化較小，base 通道又每步都有梯度，所以 base 通道一直是最重要的。
-4. **匯出的寬模型不能取代單獨訓練的寬模型**（低 1.3 到 15 個百分點）。
-5. **實驗範圍和論文不同。** 論文的增益來自 ImageNet、MobileNet 類模型、150 epoch。本專案沒有重現那個設定，所以結論只適用於小資料集、短訓練與 TinyResNet。
+4. **匯出的寬模型不能取代單獨訓練的寬模型**（低 1.3 到 20 個百分點）。
+5. **實驗範圍和論文不同。** 論文的增益來自 ImageNet、MobileNet 類模型、150 epoch。官方預設還會在最後 75 個 epoch 停止寬度增強，並每個 epoch 排序。本專案沒有重現那個設定，所以結論只適用於小資料集、短訓練與 TinyResNet。
 
 ## 未來工作
 

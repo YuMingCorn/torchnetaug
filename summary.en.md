@@ -6,7 +6,7 @@ Status: finished (2026-11-23).
 
 ## Conclusion
 
-This project implemented Network Augmentation (NetAug, Cai et al., ICLR 2022) in pure PyTorch and tested its effect on CIFAR-10 and CIFAR-100. **The implementation is correct, but NetAug gave no significant gain in any tested setting.** The extra loss signal from the augmented networks often raised the training accuracy, but it did not raise the test accuracy of the base model. The same compute spent on 40 more epochs of training gave a significantly better result.
+This project implemented Network Augmentation (NetAug, Cai et al., ICLR 2022) in pure PyTorch and tested its effect on CIFAR-10 and CIFAR-100. **The tests show that the implementation computes the paper's definition, and no implementation error was found; but NetAug gave no significant gain in any tested setting.** The extra loss signal from the augmented networks often raised the training accuracy, but it did not raise the test accuracy of the base model. A baseline trained for 40 more epochs did significantly better. In this environment one NetAug step takes about 2.6 times as long as a baseline step, so this baseline still used less compute than NetAug.
 
 ## Work done
 
@@ -34,8 +34,8 @@ Paired difference in test accuracy of the base model against the baseline with t
 1. **The extra loss signal did not turn into generalization.** The training accuracy went up (+0.7 to +1.3 percentage points per seed on CIFAR-10); the test accuracy did not.
 2. **The augmented gradient points mostly in the same direction as the base gradient** (cosine 0.82 to 0.93 on TinyResNet), so NetAug here acts almost like a larger step size. But the control for "only a larger step size" is "inconclusive", so this is a guess.
 3. **Sorting almost never changes the base.** The added channels start with a smaller initialization, and the base channels get a gradient at every step, so the base channels stay the most important.
-4. **An exported wide model cannot replace a wide model trained alone** (1.3 to 15 percentage points lower).
-5. **The experiments differ from the paper.** The gains of the paper come from ImageNet, MobileNet-class models and 150 epochs. This project did not reproduce that setup, so the conclusion applies only to small datasets, short training and TinyResNet.
+4. **An exported wide model cannot replace a wide model trained alone** (1.3 to 20 percentage points lower).
+5. **The experiments differ from the paper.** The gains of the paper come from ImageNet, MobileNet-class models and 150 epochs. The official default also stops width augmentation for the last 75 epochs and sorts every epoch. This project did not reproduce that setup, so the conclusion applies only to small datasets, short training and TinyResNet.
 
 ## Future work
 

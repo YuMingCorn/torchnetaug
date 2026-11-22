@@ -4,7 +4,7 @@
 
 在純 PyTorch 中實作 **Network Augmentation（NetAug）**。
 
-> **專案狀態：已結束（2026-11-23）。** 實作已通過正確性驗證，但在本專案的 CIFAR 實驗中，NetAug 沒有顯著提高小模型的測試準確率。見 [summary.md](summary.md)。
+> **專案狀態：已結束（2026-11-23）。** 測試顯示實作符合論文的定義，但在本專案的 CIFAR 實驗中，NetAug 沒有顯著提高小模型的測試準確率。見 [summary.md](summary.md)。
 
 NetAug 出自 Han Cai 等人的論文 [*Network Augmentation for Tiny Deep Learning*](https://arxiv.org/abs/2110.08890)（ICLR 2022）。小模型的問題通常是**欠擬合**，不是過擬合。NetAug 在訓練時把小模型嵌進更寬的模型裡一起訓練，讓小模型得到額外的監督訊號。訓練完只匯出小模型，**推論成本不變**。
 

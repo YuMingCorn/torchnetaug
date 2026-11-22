@@ -4,7 +4,7 @@
 
 A pure-PyTorch implementation of **Network Augmentation (NetAug)**.
 
-> **Project status: finished (2026-11-23).** The implementation passes the correctness checks, but in the CIFAR experiments of this project NetAug did not significantly improve the test accuracy of tiny models. See [summary.en.md](summary.en.md).
+> **Project status: finished (2026-11-23).** The tests show that the implementation computes the paper's definition, but in the CIFAR experiments of this project NetAug did not significantly improve the test accuracy of tiny models. See [summary.en.md](summary.en.md).
 
 NetAug comes from the paper [*Network Augmentation for Tiny Deep Learning*](https://arxiv.org/abs/2110.08890) by Han Cai et al. (ICLR 2022). The usual problem of a tiny model is **underfitting**, not overfitting. During training, NetAug embeds the tiny model in wider models and trains them together, so the tiny model gets extra supervision. After training, only the tiny model is exported, so **the inference cost does not change**.
 
