@@ -5,6 +5,7 @@ Example:
     uv run python examples/cifar_netaug.py --method netaug --seed 0
     uv run python examples/cifar_netaug.py --method netaug --seed 0 --sort-every 10
     uv run python examples/cifar_netaug.py --method netaug --seed 0 --depth 1 --width-mults 1.0
+    uv run python examples/cifar_netaug.py --method netaug --seed 0 --dataset cifar100 --width 0.5
 
 Each run appends one JSON line to ``--out`` (default ``runs/cifar_results.jsonl``).
 The whole dataset lives on the GPU and augmentation (random crop + flip) runs there too,
@@ -115,7 +116,8 @@ def evaluate(model: nn.Module, x: torch.Tensor, y: torch.Tensor, bs: int = 1000)
 def run_key(r: dict) -> tuple:
     return (r["dataset"], r["model"], r["epochs"], r["method"], r["sort_every"], r["seed"],
             tuple(r["width_mults"]), r["alpha"], r["stop_aug"], r.get("width", 1.0), r.get("depth", 0),
-            r.get("lr", 0.1), r.get("wd", 5e-4), r.get("amp", "bf16"))
+            r.get("lr", 0.1), r.get("wd", 5e-4), r.get("amp", "bf16"),
+            r.get("init", "base"), r.get("granularity", "group"), r.get("warmup", 0))
 
 
 def base_masks(model: NetAugModel) -> dict:
@@ -201,6 +203,8 @@ def main() -> None:
     p.add_argument("--bs", type=int, default=128)
     p.add_argument("--lr", type=float, default=0.1)
     p.add_argument("--wd", type=float, default=5e-4)
+    p.add_argument("--warmup", type=int, default=0,
+                   help="epochs of linear learning-rate warmup before the cosine decay")
     p.add_argument("--amp", default="bf16", choices=["bf16", "fp16", "off"],
                    help="mixed precision of the training forward pass (fp16 uses a gradient scaler)")
     p.add_argument("--seed", type=int, default=0)
@@ -214,7 +218,16 @@ def main() -> None:
     p.add_argument("--eval-random", type=int, default=3,
                    help="NetAug only: also report accuracy of this many per-group random widths")
     p.add_argument("--width", type=float, default=1.0,
-                   help="baseline only: train a plain TinyResNet at this width (reference for the exported widths)")
+                   help="TinyResNet only: width of the base model relative to (8, 16, 32, 64). For the "
+                        "baseline this is the model trained alone; for NetAug it is the base model")
+    p.add_argument("--init", default="base", choices=["base", "max"],
+                   help="NetAug only. base: the base weights keep the initialization of the plain model "
+                        "(same as the baseline of the same seed) and the added channels get the default "
+                        "initialization. max: the default initialization is applied again to the whole "
+                        "max-width network, as the official code does; the base weights then differ "
+                        "from the baseline of the same seed")
+    p.add_argument("--granularity", default="group", choices=["group", "global"],
+                   help="NetAug only: sample a width for each channel group, or one multiplier for the whole model")
     p.add_argument("--depth", type=int, default=0,
                    help="depth augmentation: extra blocks after each TinyResNet stage (netaug only)")
     p.add_argument("--grad-log-every", type=int, default=0,
@@ -229,11 +242,14 @@ def main() -> None:
                    "method": args.method, "sort_every": args.sort_every if args.method == "netaug" else 0,
                    "seed": args.seed, "width_mults": args.width_mults, "alpha": args.alpha,
                    "stop_aug": args.stop_aug, "width": args.width, "depth": args.depth,
-                   "lr": args.lr, "wd": args.wd, "amp": args.amp})
+                   "lr": args.lr, "wd": args.wd, "amp": args.amp,
+                   "init": args.init, "granularity": args.granularity, "warmup": args.warmup})
     if args.depth and (args.method != "netaug" or args.model != "resnet_tiny"):
         p.error("--depth is only for --method netaug --model resnet_tiny")
-    if args.width != 1.0 and (args.method != "baseline" or args.model != "resnet_tiny"):
-        p.error("--width is only for --method baseline --model resnet_tiny")
+    if args.width != 1.0 and args.model != "resnet_tiny":
+        p.error("--width is only for --model resnet_tiny")
+    if args.method != "netaug" and (args.init != "base" or args.granularity != "group"):
+        p.error("--init and --granularity are only for --method netaug")
     if args.skip_existing and Path(args.out).exists():
         with open(args.out, encoding="utf-8") as f:
             if any(run_key(json.loads(line)) == key for line in f if line.strip()):
@@ -254,6 +270,13 @@ def main() -> None:
         # depth: the second block of each stage (layers.1, .3, .5, .7) gets extra copies
         depth = {f"layers.{2 * s + 1}": args.depth for s in range(4)} if args.depth else None
         model: nn.Module = NetAugModel(base, xtr[:2], width_mults=args.width_mults, depth=depth)
+        if args.init == "max":
+            # Initialize the largest network as a whole (the official code does this). The
+            # default initializer scales with the fan-in, which is now the max-width fan-in
+            # for the base channels too. BN weights stay 1 / 0 (0 in residual extra blocks).
+            for _, layer in model.dynamic_layers():
+                if isinstance(layer, (DynamicConv2d, DynamicLinear)):
+                    layer.reset_parameters()
         print(model.graph.summary())
     else:
         model = base
@@ -265,7 +288,14 @@ def main() -> None:
                           lr=args.lr, momentum=0.9, nesterov=True)
     steps_per_epoch = xtr.shape[0] // args.bs
     total = steps_per_epoch * args.epochs
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / total)))
+    warm = steps_per_epoch * args.warmup
+
+    def lr_factor(s):  # linear warmup over `warm` steps, then cosine decay to 0
+        if s < warm:
+            return (s + 1) / warm
+        return 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, total - warm)))
+
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
     aug_until = int(round(args.epochs * (1 - args.stop_aug)))
 
     def crit(out, y):  # float32 loss even though the forward pass runs in bf16
@@ -325,7 +355,7 @@ def main() -> None:
             if args.method == "netaug":
                 logged = probe is not None and s % args.grad_log_every == 0
                 loss, _ = netaug_step(model, xb, yb, crit, alpha=args.alpha, augment=epoch < aug_until,
-                                      generator=rng, forward=fwd,
+                                      generator=rng, granularity=args.granularity, forward=fwd,
                                       backward=probe.backward if logged else backward)
                 if logged:
                     probe.finish_step()
@@ -394,7 +424,8 @@ def main() -> None:
     rec = {"method": args.method, "model": args.model, "dataset": args.dataset, "seed": args.seed,
            "epochs": args.epochs, "width_mults": args.width_mults, "alpha": args.alpha,
            "stop_aug": args.stop_aug, "sort_every": key[4], "width": args.width, "depth": args.depth,
-           "lr": args.lr, "wd": args.wd, "amp": args.amp, "params": n_base,
+           "lr": args.lr, "wd": args.wd, "amp": args.amp, "init": args.init, "warmup": args.warmup,
+           "granularity": args.granularity, "params": n_base,
            "test_acc": test_acc, "train_acc": train_acc, "width_acc": width_acc,
            "random_acc": random_acc, "sort_log": sort_log, "epoch_loss": epoch_loss,
            "grad_log": grad_log,

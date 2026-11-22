@@ -6,18 +6,19 @@ Date: 2026-11-19. For the terms, see [glossary.md](glossary.md).
 
 ## Summary
 
-This report answers four questions. It also records the verification method, the experiment results, and the problems found.
+This report answers five questions. It also records the verification method, the experiment results, and the problems found.
 
 1. **Does NetAug have depth augmentation?** The paper, the official code (MIT HAN Lab), and the reference implementation `netaug/` augment only width. The reference implementation has a `max_depth` parameter, but nothing uses it. This package adds depth augmentation (`NetAugModel(..., depth={...})`). It follows the elastic depth of Once-for-All, from the same research group.
 2. **Can you build a network directly from Dynamic modules?** Yes. You can set the widths by hand, and the output is exactly the same as a plain network. But then you must handle the width and channel sorting of every layer yourself. The recommended way is to compose the network from ordinary `torch.nn` layers in the usual PyTorch way, and then pass it to `NetAugModel`. The channel analysis then handles width switching, channel sorting, and export automatically, for any kind of model. A model that contains dynamic layers is now rejected explicitly.
 3. **Can the exported model be converted to ONNX?** Yes. The exported models at base, ×2, and random widths convert with both the dynamo and the TorchScript exporters. The onnxruntime output matches PyTorch.
 4. **How well does it work?** With CIFAR-10, TinyResNet, 40 epochs, and 3 seeds, the effect on the base model is small and not significant: width augmentation +0.15 ± 0.74, with sorting +0.34 ± 0.44, depth augmentation −0.05 ± 0.29, and width + depth +0.04 ± 0.34 percentage points. Train accuracy rises in every setting, which matches the "reduce underfitting" mechanism, but this does not turn into test accuracy. The wider networks exported from the NetAug model are worse than networks of the same width trained alone. Every exported model has an output difference of 0 from the dynamic network (Sections 3 and 5).
+5. **Does NetAug work, and does the implementation have a problem?** In a setting that underfits more (CIFAR-100, TinyResNet at base widths ×0.25, ×0.5 and ×1, 3 to 8 seeds), no setting gives a test gain either. The same compute spent on 40 more epochs gives a significant gain of +1.54 percentage points. Three recipe options of the official code and the paper's weight decay give no gain either, but these settings have only 5 seeds and read "inconclusive". No implementation bug was found that would make NetAug fail. A first MobileNetV2 result (1 seed) shows NetAug training worse, still 4.1 points lower with the official warmup; the cause is not identified (Section 10).
 
 ## 1. Environment
 
 | Item | Version |
 |---|---|
-| Code | Branch `feat/torchnetaug` (commit `941b37a` when the experiments started; commit `83e5073` for the depth experiments) |
+| Code | Branch `feat/torchnetaug` (commit `941b37a` when the experiments started; commit `83e5073` for the depth experiments; commit `5fc4285` plus uncommitted changes in `examples/` for Section 10) |
 | Python | 3.14.3 |
 | PyTorch | 2.11.0+cu128 (all tests also ran on the 2.15.0 CPU build) |
 | ONNX | onnx 1.23.2, onnxscript 0.7.2, onnxruntime 1.32.0 |
@@ -224,8 +225,93 @@ Another approach is to provide the package's own composition modules (for exampl
 
 ## 9. Limitations
 
-- Each setting has only 3 seeds and 40 epochs, on CIFAR-10 and one model only. Differences smaller than about 0.5 percentage points cannot be told apart from seed noise.
+- In Sections 3 to 5 each setting has only 3 seeds and 40 epochs, on CIFAR-10 and one model only. Section 10 uses CIFAR-100 with 3 to 8 seeds per setting, and only 1 seed for MobileNetV2. Differences smaller than about 0.5 percentage points cannot be told apart from seed noise.
 - The minutes per run are only a rough reference: during some runs, the same GPU was also running tests or other programs.
 - Depth augmentation works only on blocks that keep the shape and run once per forward pass, and it requires `torch.fx` tracing.
 - Multi-GPU (DDP) is not tested yet.
 - A custom buffer registered on a layer that is widened (Conv, Linear, BN) is not supported: it is lost when the layer is replaced by a dynamic layer.
+
+## 10. Does NetAug work? A CIFAR-100 diagnosis
+
+Date: 2026-11-23. The effect in Section 3 is small. This section checks why: the setting does not suit NetAug, the implementation has a problem, or NetAug does not help in this kind of setting.
+
+### 10.1 Design
+
+- **An underfitting setting.** NetAug aims to reduce the underfitting of small models. On CIFAR-10 the train accuracy of TinyResNet is already close to its test accuracy, so the diagnosis uses CIFAR-100 and narrower TinyResNets. At base width ×0.25 (2, 4, 8 and 16 channels) the train accuracy is only 33.8%, which is clear underfitting.
+- **Paired comparison.** Each setting is compared with the baseline of the same seed. The report gives the mean difference and its 95% confidence interval (t distribution).
+- **Decision rule, fixed before the runs.** Lower bound of the interval above 0: "gain". Upper bound below +0.5 points: "no material gain". Otherwise: "inconclusive".
+- **Controls.**
+  - Learning rate 0.2 with weight decay 2.5e-4. The NetAug loss is the sum of two losses, which makes the gradient larger. This control checks for "only a larger step".
+  - The baseline trained for 80 epochs, about the compute of NetAug.
+  - Models of width ×2 and ×3 trained alone, to compare with the wide models exported from NetAug.
+- **To reproduce:** `examples/run_diagnosis.sh` (stages `main`, `dose`, `controls`, `alone`, `ablations`, `sanity`, `recipe`), `examples/summarize.py --ref-epochs 40` for the tables and `examples/plot_results.py` for the figures.
+
+### 10.2 Results for the base model
+
+CIFAR-100, TinyResNet, 40 epochs. Differences are in percentage points of test (or train) accuracy, with the 95% confidence interval in brackets.
+
+| Setting | n | Test accuracy | Test difference | Train difference | Reading |
+|---|---|---|---|---|---|
+| ×0.25 baseline | 8 | 32.54 | — | — | — |
+| ×0.25 NetAug | 8 | 32.41 | −0.14 [−0.76, +0.49] | +0.08 [−0.43, +0.58] | no material gain |
+| ×0.25 NetAug, largest network initialized as a whole (`--init max`) | 5 | 32.72 | +0.32 [−1.11, +1.74] | +0.04 [−1.24, +1.32] | inconclusive |
+| ×0.25 NetAug, augmentation stopped for the last half (`--stop-aug 0.5`) | 5 | 32.59 | +0.18 [−0.65, +1.00] | +0.16 [−0.38, +0.69] | inconclusive |
+| ×0.25 NetAug, sorting every epoch + `--init max` | 5 | 32.16 | −0.25 [−1.44, +0.94] | −0.38 [−2.11, +1.35] | inconclusive |
+| ×0.25 NetAug, weight decay 5e-5 (against the baseline with the same weight decay) | 5 | 30.81 | −0.22 [−2.34, +1.89] | −0.22 [−2.50, +2.07] | inconclusive |
+| ×0.5 NetAug | 5 | 47.31 | +0.59 [−1.19, +2.36] | +0.66 [−0.95, +2.27] | inconclusive |
+| ×1 NetAug | 5 | 59.52 | −0.46 [−1.05, +0.14] | +0.89 [−0.40, +2.18] | no material gain |
+| Control: ×0.25 baseline, learning rate 0.2, weight decay 2.5e-4 | 8 | 32.48 | −0.06 [−1.17, +1.04] | +0.02 [−1.34, +1.38] | inconclusive |
+| Control: ×0.25 baseline, weight decay 5e-5 | 5 | 31.03 | −1.38 [−2.78, +0.03] | −1.64 [−3.04, −0.24] | no material gain |
+| Control: ×0.25 baseline, 80 epochs | 8 | 34.09 | **+1.54 [+0.85, +2.24]** | +1.58 [+0.97, +2.19] | gain |
+
+![Paired differences](figures/paired_diff.png)
+
+- **No NetAug setting gives a test gain.** Two NetAug settings, ×0.25 and ×1, read "no material gain"; the other NetAug settings read "inconclusive". The ×0.25 upper bound of +0.49 is only 0.01 below the +0.5 cutoff, so that reading holds only just.
+- **The same compute spent on 40 more epochs gives +1.54 points, a significant gain.** In this harness a NetAug step takes about 2.6 times as long as a baseline step (the paper reports +16.7%), so this comparison holds only for this harness.
+- **The train difference grows with the base width:** ×0.25 +0.08, ×0.5 +0.66, ×1 +0.89. All three intervals include 0, so this is only a trend. At ×1 the train accuracy goes up and the test accuracy goes down. The paper's ResNet50 shows the same pattern (train accuracy up, validation accuracy down).
+- **The paper says smaller models gain more. This diagnosis does not show that.** ×0.25 underfits the most but gains the least.
+
+### 10.3 Exported wide models
+
+![Width multiplier](figures/acc_vs_width_mult.png)
+
+![Parameters](figures/acc_vs_params.png)
+
+| Base width | Exported ×2 | Exported ×3 | Trained alone at the same width |
+|---|---|---|---|
+| ×0.25 | 39.04 | 40.47 | 46.72 (×2), 55.13 (×3) |
+| ×0.25, augmentation stopped at 0.5 | 34.61 | 35.02 | as above |
+| ×0.5 | 52.28 | 53.06 | 59.98 (×2) |
+
+- The exported wide models are 7 to 15 points below the models of the same width trained alone. When each channel group samples its own width, the full ×3 network is almost never sampled. The networks actually sampled in training (19k to 92k parameters) reach 36.97 ± 2.41% when exported, against 46.7% for a 47.6k-parameter model trained alone.
+- **Wide-path check (stage `sanity`).** One multiplier, ×1 or ×2, is sampled for the whole network, so half of the augmented steps train the full ×2 network. The exported ×2 model reaches 41.22 ± 1.56% (n=3). The ×2 network is trained in only about half of the steps, so a control was added afterwards: the ×2 model trained alone for 20 epochs reaches 43.2% (n=3, `ALONE_WIDTHS=0.5 EPOCHS=20 ABLATION_SEEDS="0 1 2" STAGES=alone bash examples/run_diagnosis.sh`). The gap is about 2 points; against the ×2 model trained alone for 40 epochs (46.72%) it is 5.5 points. The ×2 network shares its weights with the base, and this control was not planned in advance, so the reading of this check is "inconclusive": it shows no clear defect, but it does not prove that the wide path is free of problems.
+- The output of every exported model equals the output of the dynamic network.
+
+### 10.4 Gradients
+
+![Gradients](figures/gradient.png)
+
+Every 20 steps, the run logs the cosine and the norm ratio of the augmented gradient against the base gradient on the base weights. At all three widths the cosine is between 0.82 and 0.93 and the norm ratio is between 0.87 and 0.97. At a cosine of 0.82 to 0.92, the component orthogonal to the base gradient is still about 40% to 57% of the base gradient norm, so "no new information" is too strong. The result is consistent with "here NetAug acts mainly like a larger step", but it does not show that this is the cause: the control for this idea (learning rate 0.2, weight decay 2.5e-4) reads "inconclusive". The three widths give similar values, so the gradients do not explain the differences between widths.
+
+### 10.5 Sorting
+
+With sorting every epoch, the 39 sorts move only 0 to 4 channels into the base in total (per seed). The base channels receive both the base and the augmented gradients at every step, so they are already the most important channels. This agrees with Section 4.
+
+### 10.6 MobileNetV2 (preliminary, 1 seed)
+
+The paper's gains come from MobileNet-style models, so torchvision's MobileNetV2 (width 0.35, 524k parameters) was also tried.
+
+- 40 epochs: baseline 41.61%, NetAug 36.50%. The NetAug base loss is above the baseline from the first epoch on, and the gap persists. The exported ×2 and ×3 models reach only 38.3% and 38.6%.
+- In the first epoch the cosine of the augmented against the base gradient is 0.25 and the norm ratio is 3.1. Later the cosine reaches only 0.4 to 0.64 (TinyResNet: 0.8 to 0.93).
+- 10-epoch probes: baseline 20.7%, NetAug 13.0%, NetAug at learning rate 0.05 18.2%, NetAug with α=0 19.6%, baseline at learning rate 0.2 with weight decay 2.5e-4 20.8%. So the wrapper's forward pass is not the cause, and a doubled step alone does not make the baseline worse; the problem is in the gradient of the augmented loss.
+- Initializing the added channels with torchvision's rule (fan-out) made it worse (10.0% after 10 epochs). The official code also says that fan-out works badly at large expand ratios, so this change was reverted.
+- This model does not support a conclusion yet. torchvision's MobileNetV2 has a total stride of 32, so a 32×32 input ends at 1×1, and the baseline reaches only 41.6% (TinyResNet ×1 reaches 60% with 182k parameters). Width does still help here: MobileNetV2 at width 0.5 trained alone reaches 45.02% (816k parameters), 3.4 points above width 0.35.
+- The raw data is in `runs/diag/mbv2_default_init/`. Command: `uv run python examples/cifar_netaug.py --model {mbv2_035,mbv2_050} --method {baseline,netaug} --dataset cifar100 --epochs 40 --seed 0 --eval-widths 1.0 2.0 3.0 --out <file>`. The short probes use `--epochs 10`, plus `--grad-log-every 20`, `--alpha 0` or `--lr 0.05 --wd 1e-3`.
+- **With the official 5-epoch warmup (`--warmup 5`):** baseline 44.86%, NetAug 40.80%, exported ×2 and ×3 42.27% and 42.46%. Warmup improves both runs (baseline +3.3, NetAug +4.3 points), but NetAug is still 4.1 points lower. In the first epoch the norm ratio drops from 3.1 to 1.2, and the cosine is still only 0.12. So the missing warmup is not the main reason that NetAug is worse.
+- Conclusion: **in this harness NetAug trains MobileNetV2 worse, and the cause is not identified.** This is not a verdict on the MobileNet architecture.
+
+### 10.7 Conclusions
+
+- **Implementation:** no bug was found that would make NetAug fail. The correctness tests show that one NetAug step equals Eq. 2 of the paper (Section 2.1). Exported models equal the dynamic network exactly. The wide-path check shows no clear defect, but its reading is "inconclusive".
+- **Effect:** on CIFAR-100 with TinyResNet and 40 epochs, NetAug does not raise the test accuracy of the base model. Three recipe options of the official code (initializing the largest network, stopping augmentation, sorting every epoch) and the paper's weight decay do not change this. These runs have only 5 seeds, and their reading is "inconclusive".
+- **Possible reasons (not shown):** the paper's gains come from MobileNet-style models on ImageNet, where the augmentation widens the expand channels of inverted blocks, trained for 150 epochs with a 5-epoch warmup. This diagnosis differs in architecture, dataset and training length. With the official warmup, NetAug still trains MobileNetV2 worse here (Section 10.6). A test on MobileNet-style models first needs strides suited to 32×32 inputs.

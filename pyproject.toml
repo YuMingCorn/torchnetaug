@@ -9,10 +9,14 @@ requires-python = ">=3.10"
 dependencies = ["torch>=2.4"]
 
 [project.optional-dependencies]
-examples = ["torchvision"]
+examples = [
+    "matplotlib>=3.10.9",
+    "torchvision",
+]
 
 [dependency-groups]
 dev = [
+    "matplotlib>=3.10.9",
     "onnx>=1.23.2",
     "onnxruntime>=1.23.2",
     "onnxscript>=0.7.2",

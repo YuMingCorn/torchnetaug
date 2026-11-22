@@ -453,6 +453,25 @@ uv run python examples/summarize.py runs/cifar100_regime.jsonl
 - 4 組設定：baseline、baseline 學習率 0.2、NetAug 寬度倍數 1/2/3、NetAug 寬度倍數 1/1.2/1.4。學習率 0.2 的 baseline 用來檢查「NetAug 是否只是把 base 的梯度加倍」（見 [architecture.md 第 8.1 節](docs/architecture.md)）。
 - `--grad-log-every N`：每 N 步記錄 base 權重上 base 梯度與增強梯度的 cosine 相似度與長度比。
 - `--amp {bf16,fp16,off}`：訓練 forward 的精度。沒有 bfloat16 的 GPU（例如 T4）用 `fp16`。不同精度的結果在表中分開列出。
+- `--warmup N`：先用 N 個 epoch 把學習率線性升到 `--lr`，再做 cosine 衰減（預設 0；官方程式用 5）。不同 warmup 的結果在表中分開列出。
+
+### 診斷：欠擬合設定、對照組與訓練配方
+
+```bash
+STAGES="main controls alone ablations" bash examples/run_diagnosis.sh   # CIFAR-100，base 寬度 0.25
+SEEDS="0 1 2 3 4" STAGES="dose" bash examples/run_diagnosis.sh          # base 寬度 0.5、1.0
+STAGES="sanity recipe" bash examples/run_diagnosis.sh                    # 追加檢查
+uv run python examples/summarize.py runs/diag/method_*.jsonl
+uv run python examples/plot_results.py --out runs/plots runs/diag/method_*.jsonl
+```
+
+- 每次執行寫入自己的檔案 `runs/diag/<設定>.jsonl`，已完成的會跳過，所以中斷後可以重跑。
+- `main`：baseline 與 NetAug，8 個 seed。`dose`：較寬的 base，檢查「越窄的模型增益越大」。`controls`：學習率 0.2 加 weight decay 2.5e-4（等於把 loss 加倍），以及 2 倍 epochs（約等於 NetAug 的計算量）。`alone`：單獨訓練的 ×2、×3 寬度模型。`ablations`：官方程式的配方選項。`sanity`：整個網路一起抽 ×1 或 ×2，一半的增強步驟訓練整個 ×2 網路，檢查匯出的 ×2 模型是否接近單獨訓練的 ×2 模型。`recipe`：論文的 weight decay（這裡用 5e-5）。
+- `--width`：TinyResNet 的 base 寬度（相對於 8、16、32、64 個通道）；對 NetAug 是 base 模型的寬度。
+- `--init max`：對最大網路整體重新初始化 conv 與 linear 的權重（官方程式的做法）；預設 `base` 是先初始化 base 再擴寬。
+- `--granularity {group,global}`：增強網路的寬度是每個通道群組各自抽樣，或全部一起抽樣。
+- `summarize.py` 的配對差異表列出每個 seed 的差異、平均與 95% 信賴區間。NetAug 和相同學習率、weight decay 與精度的 baseline 比較（如果有的話），其他設定和預設配方的 baseline 比較。`--ref-epochs N` 讓所有設定都和 N epochs 的 baseline 比較。
+- `plot_results.py` 用 matplotlib 畫出四張圖：準確率對參數量、準確率對寬度倍數（NetAug 匯出的模型對單獨訓練的模型）、配對差異的 95% 信賴區間、以及增強梯度與 base 梯度的 cosine 與長度比。`--variant` 選擇要畫的 NetAug 設定（預設 `netaug`；名稱與 `summarize.py` 印出的設定名稱相同，例如 `"netaug init-max"`）。
 
 ## 實驗結果
 

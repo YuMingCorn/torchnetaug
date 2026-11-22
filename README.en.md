@@ -453,6 +453,25 @@ uv run python examples/summarize.py runs/cifar100_regime.jsonl
 - 4 settings: baseline, baseline with learning rate 0.2, NetAug with width multipliers 1/2/3, NetAug with width multipliers 1/1.2/1.4. The baseline with learning rate 0.2 checks whether NetAug only doubles the base gradient (see [architecture.en.md Section 8.1](docs/architecture.en.md)).
 - `--grad-log-every N`: every N steps, record the cosine similarity and the norm ratio of the base gradient and the augmented gradient on the base weights.
 - `--amp {bf16,fp16,off}`: the precision of the training forward pass. Use `fp16` on a GPU without bfloat16 (for example the T4). Results with different precisions are listed separately in the tables.
+- `--warmup N`: raise the learning rate linearly to `--lr` over N epochs, then apply the cosine decay (default 0; the official code uses 5). Results with different warmups are listed separately in the tables.
+
+### Diagnosis: an underfitting setting, controls and training recipe
+
+```bash
+STAGES="main controls alone ablations" bash examples/run_diagnosis.sh   # CIFAR-100, base width 0.25
+SEEDS="0 1 2 3 4" STAGES="dose" bash examples/run_diagnosis.sh          # base widths 0.5 and 1.0
+STAGES="sanity recipe" bash examples/run_diagnosis.sh                    # follow-up checks
+uv run python examples/summarize.py runs/diag/method_*.jsonl
+uv run python examples/plot_results.py --out runs/plots runs/diag/method_*.jsonl
+```
+
+- Each run writes its own file `runs/diag/<settings>.jsonl`. Finished runs are skipped, so the script can be restarted after an interruption.
+- `main`: baseline and NetAug, 8 seeds. `dose`: wider base models, to check that a narrower model gains more. `controls`: learning rate 0.2 with weight decay 2.5e-4 (the same as doubling the loss), and 2 times the epochs (about the compute of NetAug). `alone`: models of width x2 and x3 trained alone. `ablations`: recipe options of the official code. `sanity`: one multiplier, x1 or x2, sampled for the whole network, so half of the augmented steps train the full x2 network; checks that the exported x2 model comes close to the x2 model trained alone. `recipe`: the weight decay of the paper (5e-5 here).
+- `--width`: the base width of TinyResNet (relative to 8, 16, 32, 64 channels). For NetAug it is the width of the base model.
+- `--init max`: initialize the conv and linear weights of the largest network as a whole (as the official code does). The default `base` initializes the base model and then widens it.
+- `--granularity {group,global}`: sample the width of the augmented network for each channel group separately, or for all groups together.
+- The paired-difference table of `summarize.py` lists the difference for each seed, the mean and the 95% confidence interval. NetAug is compared with the baseline of the same learning rate, weight decay and precision if there is one; every other setting is compared with the default-recipe baseline. `--ref-epochs N` compares every setting with the N-epoch baseline.
+- `plot_results.py` draws four figures with matplotlib: accuracy against parameter count, accuracy against width multiplier (models exported from NetAug against models trained alone), the 95% confidence intervals of the paired differences, and the cosine and norm ratio of the augmented gradient against the base gradient. `--variant` selects the NetAug setting to plot (default `netaug`; the names are the setting names that `summarize.py` prints, for example `"netaug init-max"`).
 
 ## Experiment results
 
