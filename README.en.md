@@ -387,7 +387,7 @@ The 471 tests compare against plain PyTorch models built without this package. T
 
 ## Experiment findings
 
-On CIFAR-10 and CIFAR-100 (TinyResNet, 40 epochs), NetAug did not significantly improve the test accuracy of the base model. The same compute spent on 40 more epochs of plain training gave a significant gain of +1.54 percentage points. For the results, observations, and commands to reproduce them, see [docs/experiments.en.md](docs/experiments.en.md). For the project summary and future work, see [summary.en.md](summary.en.md).
+On CIFAR-10 and CIFAR-100 (TinyResNet, 40 epochs), NetAug did not significantly improve the test accuracy of the base model. A baseline trained for 40 more epochs (2 times the compute, still less than the about 2.6 times of NetAug in this environment) gave a significant gain of +1.54 percentage points. For the results, observations, and commands to reproduce them, see [docs/experiments.en.md](docs/experiments.en.md). For the project summary and future work, see [summary.en.md](summary.en.md).
 
 ## Citation and references
 

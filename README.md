@@ -387,7 +387,7 @@ uv run pytest
 
 ## 實驗結論
 
-在 CIFAR-10 與 CIFAR-100（TinyResNet，40 epoch）上，NetAug 都沒有顯著提高 base 模型的測試準確率；同樣的計算量用來多訓練 40 epoch 則有 +1.54 個百分點的顯著增益。結果、觀察與重現指令見 [docs/experiments.md](docs/experiments.md)，專案總結與未來工作見 [summary.md](summary.md)。
+在 CIFAR-10 與 CIFAR-100（TinyResNet，40 epoch）上，NetAug 都沒有顯著提高 base 模型的測試準確率；baseline 多訓練 40 epoch（2 倍計算量，仍少於本環境中 NetAug 的約 2.6 倍）則有 +1.54 個百分點的顯著增益。結果、觀察與重現指令見 [docs/experiments.md](docs/experiments.md)，專案總結與未來工作見 [summary.md](summary.md)。
 
 ## 引用與參考資料
 
