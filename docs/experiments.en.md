@@ -4,15 +4,20 @@
 
 Dates: 2026-11-19 (CIFAR-10), 2026-11-23 (CIFAR-100). For the code design and correctness verification, see [design.en.md](design.en.md). For the project summary, see [summary.en.md](../summary.en.md). For terms, see [glossary.md](glossary.md).
 
-## 1. Conclusions
+## 1. Key points
 
-- **In every tested setting, NetAug did not significantly improve the test accuracy of the base model.** On CIFAR-10 the gain is at most +0.34 percentage points, smaller than the seed noise. On CIFAR-100, no NetAug setting has a 95% confidence interval with a lower bound above 0.
-- **A baseline trained for 40 more epochs (about 2 times the compute, still less than the 2.6 times of NetAug in this environment) gains +1.54 percentage points (95% CI [+0.85, +2.24]), and this gain is significant.**
-- The training accuracy often goes up (+0.7 to +1.3 percentage points per seed on CIFAR-10), but this does not turn into test accuracy.
-- Depth augmentation, channel sorting, and the recipe options of the official code did not change the result.
-- Wide models exported from a NetAug model are 1.3 to 20 percentage points below models of the same width trained alone.
-- MobileNetV2 (1 seed) trains worse with NetAug. The cause is not known.
-- No implementation error that could make NetAug fail was found. For all exported models, the output difference from the dynamic network is 0.
+1. **NetAug did not significantly improve the test accuracy of the base model.** On CIFAR-10 the gain is at most +0.34 percentage points, smaller than the seed noise. On CIFAR-100, no NetAug setting has a 95% confidence interval with a lower bound above 0.
+2. **A baseline trained for 40 more epochs gives a significant gain**: +1.54 percentage points (95% CI [+0.85, +2.24]). It uses about 2 times the compute, still less than the 2.6 times of NetAug in this environment.
+3. **The training accuracy goes up, but the test accuracy does not** (+0.7 to +1.3 percentage points per seed on CIFAR-10). Depth augmentation, channel sorting and the recipe options of the official implementation did not change the result.
+4. **Exported wide models are 1.3 to 20 percentage points below models of the same width trained alone.** MobileNetV2 (1 seed) is worse with NetAug. The cause is not known.
+5. **No implementation error was found.** For all exported models, the output difference from the dynamic model is 0.
+
+```mermaid
+flowchart LR
+    Q["Why does NetAug not help?"] --> A["Unsuitable setup?<br/>→ Sections 4.1, 4.2: no gain even in an underfitting setup"]
+    Q --> B["Implementation error?<br/>→ Tests and Sections 4.3–4.5: no error found"]
+    Q --> C["Method does not work in this scope?<br/>→ Section 4.7: possible, not proven"]
+```
 
 ## 2. Common setup
 

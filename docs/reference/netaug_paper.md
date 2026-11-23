@@ -19,13 +19,13 @@
 ```
 
 > **查證狀態**（2026-11-19）：
-> - 第 2 節（官方 `train.py` 部分）、第 3 節（官方清單與取樣粒度）、第 4 節、第 5 節、第 7 節（repo 結構），以及第 8 節的官方欄，已逐行對照官方實作。對照的版本是 commit `0e58f314dfe12967d6165f45238b1ea77b0f7a14`（2022-06-16，master，淺層 clone）。
+> - 第 2 節（官方 `train.py` 部分）、第 3 節（官方清單與取樣粒度）、第 4 節、第 5 節、第 7 節（repo 結構），以及第 8 節，已逐行對照官方實作。對照的版本是 commit `0e58f314dfe12967d6165f45238b1ea77b0f7a14`（2022-06-16，master，淺層 clone）。
 > - 第 6 節與第 9 節的論文數字，已對照 arXiv v2 PDF 的文字抽取。圖只看到抽取出的文字，沒有看圖片。
 > - 上一版標示 ⚠️ 的三項已解決：
 >   1. `tinymbv2.sh` 沒有傳入 `stop_aug_*`，實際值是 yaml 預設（75 / 0 / 0）。
 >   2. 殘差連接最後一個 BN 的 gamma **沒有**設為 0。
 >   3. 論文 intro 的 VOC +3.36%、COCO +1.8%，來自 Figure 5 的圖上數值。原文寫「找不到」是錯的。
-> - 未查證：第 8 節的參考實作欄（`netaug/`，不在本次範圍）；`models/base/` 的 MobileNetV3、MCUNet、ProxylessNAS 基礎模型（只看了 netaug 的包裝層）；`netaug/figures/*.png`；`bash/transfer/` 的 car 以外的四個腳本（只用 grep）。
+> - 未查證：`models/base/` 的 MobileNetV3、MCUNet、ProxylessNAS 基礎模型（只看了 netaug 的包裝層）；`netaug/figures/*.png`；`bash/transfer/` 的 car 以外的四個腳本（只用 grep）。
 > - 論文 p.8 的六個「MACs 對準確率」子圖沒有圖說，本文不指定它們的圖號。
 
 **標記**：
@@ -216,26 +216,26 @@ netaug/
 └── utils/              criterion, distributed, init, lr_scheduler, metric, misc, profile
 ```
 
-## 8. 論文、官方實作與本專案參考實作的差異
+## 8. 論文與官方實作的對照
 
-本專案參考實作指根目錄的 `netaug/`，詳見 [netaug_reference_impl.md](netaug_reference_impl.md)。「論文 / 官方實作」欄已對照官方實作；參考實作欄沒有重新核對。
+本表已逐項對照官方實作。
 
-| 項目 | 論文 / 官方實作 | 參考實作 `netaug/` |
-|---|---|---|
-| 任務與模型 | 論文：ImageNet 分類（MobileNet 類）；偵測用 YOLOv3 風格頭。官方：同上，另有 MCUNet、ProxylessNAS、MBv3 的腳本 | YOLOv8 偵測（ultralytics） |
-| 增強維度 | 寬度 + expand ratio，不增強深度（論文 p.4 Figure 2） | 只有寬度（`max_depth` 未使用） |
-| 寬度倍數清單 | 論文：等距（linspace，p.4 lines 228–229）。官方：相對於基本寬度的固定倍數清單，如 `[1.0, 1.8, 2.6]` | `linspace(1, max_width, num_points) / max_width` |
-| 取樣粒度 | 論文：未寫。官方：`shortcut is None` 的 block 取樣輸出寬度（MBv2 系列即每個 stage 第一個 block）；殘差連接沿用；stem 與 head 也取樣；expand 每個 block 取樣 | **每一層各自**隨機取樣；`exclude` 類別固定 base 寬度 |
-| 每步增強網路數 | 1 個 | 1 個 |
-| Loss | 論文：`L(base) + 1.0 × L(aug)`，兩次 backward 累加梯度。官方：同左，兩者都用 label smoothing | `netaug_1.py`：同論文，但一次 backward；`netaug.py`：base 對 aug 做 KD + `L(aug)` |
-| KD | 論文：NetAug 本身不含 KD；Table 2 測試 NetAug + KD 組合（教師 Assemble-ResNet50）。官方實作：無 KD | 有（`netaug.py`） |
-| 預訓練最大網路 | 無 | 有（`netaug_1.py` 的 `aug_pretrain`） |
-| 停止增強 | 論文：未寫。官方：依剩餘 epoch，`stop_aug_w_epoch` 等（tinymbv2 從第 0-indexed 第 80 個 epoch 起停止寬度增強，見第 4 節） | 依絕對 epoch `stop_width_aug` |
-| 通道排序 | 論文：未寫。官方：只在 default 階段每個 epoch 開始時，依 pointwise 權重的 L1 排序 inverted block 的中間通道；同一排列套到相連層 | 每 50 epoch，依 L1 範數（選用）；**沒有重排下游層輸入維度，排序後網路的運算結果會改變** |
-| 重新校正 BN 統計值 | 論文：未寫。官方：每個 epoch 驗證前，用最多 16,000 張固定子集（含訓練增強） | 驗證前，用整個訓練集（選用） |
-| 啟用輸入通道 | 論文：未寫。官方：從 `x.shape[1]` 推得 | 明確設定 `active_in_channels`，不一致就丟錯 |
-| 分組卷積 | 官方：有 `DynamicDepthwiseConv2d`（論文未寫） | 不支援（TODO） |
-| 匯出 | 官方：`set_active("min")` → `export()` | `set_base()` → `export_module()`，每次存檔都匯出 |
+| 項目 | 論文 / 官方實作 |
+|---|---|
+| 任務與模型 | 論文：ImageNet 分類（MobileNet 類）；偵測用 YOLOv3 風格頭。官方：同上，另有 MCUNet、ProxylessNAS、MBv3 的腳本 |
+| 增強維度 | 寬度 + expand ratio，不增強深度（論文 p.4 Figure 2） |
+| 寬度倍數清單 | 論文：等距（linspace，p.4 lines 228–229）。官方：相對於基本寬度的固定倍數清單，如 `[1.0, 1.8, 2.6]` |
+| 取樣粒度 | 論文：未寫。官方：`shortcut is None` 的 block 取樣輸出寬度（MBv2 系列即每個 stage 第一個 block）；殘差連接沿用；stem 與 head 也取樣；expand 每個 block 取樣 |
+| 每步增強網路數 | 1 個 |
+| Loss | 論文：`L(base) + 1.0 × L(aug)`，兩次 backward 累加梯度。官方：同左，兩者都用 label smoothing |
+| KD | 論文：NetAug 本身不含 KD；Table 2 測試 NetAug + KD 組合（教師 Assemble-ResNet50）。官方實作：無 KD |
+| 預訓練最大網路 | 無 |
+| 停止增強 | 論文：未寫。官方：依剩餘 epoch，`stop_aug_w_epoch` 等（tinymbv2 從第 0-indexed 第 80 個 epoch 起停止寬度增強，見第 4 節） |
+| 通道排序 | 論文：未寫。官方：只在 default 階段每個 epoch 開始時，依 pointwise 權重的 L1 排序 inverted block 的中間通道；同一排列套到相連層 |
+| 重新校正 BN 統計值 | 論文：未寫。官方：每個 epoch 驗證前，用最多 16,000 張固定子集（含訓練增強） |
+| 啟用輸入通道 | 論文：未寫。官方：從 `x.shape[1]` 推得 |
+| 分組卷積 | 官方：有 `DynamicDepthwiseConv2d`（論文未寫） |
+| 匯出 | 官方：`set_active("min")` → `export()` |
 
 ## 9. 論文的補充內容（上一版沒有寫）
 
