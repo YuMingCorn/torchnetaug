@@ -2,7 +2,9 @@
 
 [繁體中文](README.md) | **English**
 
-A pure-PyTorch implementation of **Network Augmentation (NetAug)**, which improves the accuracy of tiny models.
+A pure-PyTorch implementation of **Network Augmentation (NetAug)**.
+
+> **Project status: finished (2026-11-23).** The tests show that the implementation computes the paper's definition, but in the CIFAR experiments of this project NetAug did not significantly improve the test accuracy of tiny models. See [summary.en.md](summary.en.md).
 
 NetAug comes from the paper [*Network Augmentation for Tiny Deep Learning*](https://arxiv.org/abs/2110.08890) by Han Cai et al. (ICLR 2022). The usual problem of a tiny model is **underfitting**, not overfitting. During training, NetAug embeds the tiny model in wider models and trains them together, so the tiny model gets extra supervision. After training, only the tiny model is exported, so **the inference cost does not change**.
 
@@ -14,7 +16,7 @@ Features:
 - **Width and depth augmentation**: besides the width augmentation of the paper, you can add extra blocks after chosen blocks (depth augmentation, based on the elastic depth of Once-for-All).
 - **No change to your training loop**: replace one line, `loss.backward()`, with `netaug_step(...)`.
 
-For the internal design and the sorting method, see [docs/architecture.en.md](docs/architecture.en.md). For the experiment and verification report, see [docs/report.en.md](docs/report.en.md). For the Chinese–English term list, see [docs/glossary.md](docs/glossary.md).
+For the code design, see [docs/design.en.md](docs/design.en.md). For the experiment results, see [docs/experiments.en.md](docs/experiments.en.md). For the term list, see [docs/glossary.md](docs/glossary.md).
 
 ## Installation
 
@@ -254,7 +256,7 @@ ema = copy.deepcopy(model)
 model.sort_channels(optimizer=optimizer, extra_models=[ema])
 ```
 
-Sorting guarantees that the output at **max width** does not change, but it changes the base output (this is the purpose of sorting). So continue training after sorting. Do not sort just before export. For the theory, see [docs/architecture.en.md Section 5](docs/architecture.en.md#5-channel-sorting).
+Sorting guarantees that the output at **max width** does not change, but it changes the base output (this is the purpose of sorting). So continue training after sorting. Do not sort just before export. For the theory, see [docs/design.en.md Section 5](docs/design.en.md#5-channel-sorting).
 
 ### `recalibrate_bn`: re-estimate BN statistics
 
@@ -369,126 +371,23 @@ When you set the structure by hand, the two sides of a residual addition must us
 
 Augmented: `nn.Conv2d` (normal and depthwise), `nn.Linear`, BatchNorm, and the common operations between them (activation functions, pooling, residual addition, SE multiplication, concat, flatten).
 
-Not augmented (the related channels keep their original width, but the model is still correct): grouped convolution, GroupNorm/LayerNorm, channel shuffle, layer scale parameters, `Conv1d`/`Conv3d`, and others. For the full list, see [docs/architecture.en.md Section 2.2](docs/architecture.en.md#22-whitelist-analysis).
+Not augmented (the related channels keep their original width, but the model is still correct): grouped convolution, GroupNorm/LayerNorm, channel shuffle, layer scale parameters, `Conv1d`/`Conv3d`, and others. For the full list, see [docs/design.en.md Section 2.2](docs/design.en.md#22-whitelist-analysis).
 
 The max-width model has about `max(width_mults)²` times the parameters of the base. For example, `width_mults=(1.0, 2.0, 3.0)` gives about 9 times. Depth augmentation adds the parameters of the extra blocks.
 
 Depth augmentation works only on blocks that "keep the input shape and run only once per forward". It also needs `torch.fx` tracing (it cannot be used together with a manual `graph=`).
 
-## Verification
-
-### Correctness: automated tests
+## Tests
 
 ```bash
 uv run pytest
 ```
 
-The tests compare outputs in float64 with tight tolerances. They first randomize all parameters and BN statistics, so default values cannot hide errors. They cover 8 models (a custom conv chain, a concat model, a GroupNorm model, ResNet18, MobileNetV2, MobileNetV3, ShuffleNetV2, EfficientNet-B0):
+The 471 tests compare against plain PyTorch models built without this package. They check base mode, every width, the gradient of one step (Eq. 2 of the paper), sorting, and export. See [docs/design.en.md Section 9](docs/design.en.md#9-correctness-verification).
 
-| What is verified | Test |
-|---|---|
-| Base-mode output equals the original model | `test_base_mode_equals_original` |
-| The exported model is the original class, has the same shapes, and its output equals the base | `test_export_equals_base` |
-| Max-width output does not change after sorting (covers residual, concat and SE) | `test_sort_keeps_max_function` |
-| Order after sorting: each group's importance is non-increasing up to rounding, and sorting again only swaps channels tied up to rounding (fixed models, 60 random architectures, depth-augmented models) | `test_sort_orders_importance`, `assert_sorted` |
-| **Any combination of modules**: on 60 randomly generated architectures, max-width output does not change after sorting or any permutation, and base and export are also correct | `test_random_architectures.py` |
-| Sorting only the outputs (the method of the reference implementation) always breaks the output | `test_sort_only_outputs_breaks_function` |
-| Optimizer state is reordered correctly | `test_permutation_commutes_with_optimizer_step` |
-| Augmented networks do not pollute BN statistics | `test_aug_pass_does_not_touch_bn_stats` |
-| Gradients flow only where they should | `test_netaug_step_gradients` |
-| At each width, the parameter count, weight shapes and output equal those of a plain model built directly at that width | `tests/test_widths.py` |
-| Premises of the mathematical proof: every whitelist operation acts on each channel independently (for both permutations and subsets), and the weight permutation lemma of the dynamic layers holds (proof in [architecture.en.md 5.6](docs/architecture.en.md)) | `tests/test_whitelist_lemmas.py` |
-| A 1-channel spatial attention map is not widened; shared weights are rejected; MnasNet can be exported | `test_one_channel_broadcast_group_is_fixed`, etc. |
-| Depth augmentation: base and export equal the original model, residual copies start as the identity function, max-width output at each depth does not change after sorting, `export(sizes, depths)` equals the dynamic network, state restore, error messages | `tests/test_depth.py` |
-| After conversion to ONNX, the onnxruntime output of the exported model matches PyTorch (base, ×2, random widths) | `tests/test_onnx.py` |
-| A dynamic-layer network with widths set by hand equals a plain network; a model that contains dynamic layers is rejected explicitly; `export(sizes)` keeps the dtype | `tests/test_dynamic_usage.py` |
-| All examples in the documents run (Chinese and English versions) | `tests/test_docs.py` |
+## Experiment findings
 
-### Dynamic width check (fake data, no dataset download)
-
-```bash
-uv run python examples/check_widths_fake_data.py
-```
-
-This script uses the same model as the CIFAR experiment (TinyResNet). On synthetic data (10 classes; each class is one fixed random pattern plus strong noise), it checks:
-
-1. Before and after training, at each width from x1.0 to x3.0, the parameter count and output equal those of "a plain TinyResNet built directly at that width, loaded with the same prefix weights".
-2. It trains 400 steps with `netaug_step` and sorts every 100 steps. At each sort, the max-width output does not change, and the loss decreases.
-3. The test accuracy at each width after its own BN recalibration, and that `export()` keeps the base accuracy and size (176,402 parameters).
-
-Each check prints PASS or FAIL. If any check fails, the exit code is 1. Results on an RTX 3060 Ti on 2026-11-19 (all PASS):
-
-| Width | Parameters | Max output difference from the plain model | Test accuracy |
-|---|---|---|---|
-| x1.0 (base) | 176,402 | 0 | 67.7% |
-| x1.5 | 395,350 | 0 | 70.7% |
-| x2.0 | 701,466 | 0 | 72.7% |
-| x2.5 | 1,094,750 | 0 | 74.0% |
-| x3.0 | 1,575,202 | 0 | 73.3% |
-
-This only shows that the "size and computation" at each width are correct, and that every width can learn. The synthetic data is small, so the accuracy numbers do not show the effect of NetAug. For the effect, see the CIFAR-10 experiment below.
-
-### Effect: CIFAR-10 comparison experiment
-
-```bash
-bash examples/run_cifar10_compare.sh            # baseline, NetAug, NetAug + sorting; 3 seeds each
-bash examples/run_cifar10_depth.sh              # depth augmentation, width + depth augmentation; 3 seeds each
-uv run python examples/summarize.py runs/cifar10_compare.jsonl runs/cifar10_depth.jsonl
-```
-
-- Each run adds one line to the jsonl file. The line records the test and train accuracy of the base model.
-- NetAug runs also record the test accuracy at widths ×1.0, ×1.5, ×2.0, ×2.5 and ×3.0. Each width gets its own BN recalibration on a copy. Training never samples ×1.5 or ×2.5, so these widths check whether accuracy changes smoothly with width.
-- The gap from a single run can be just noise, so compare the mean and standard deviation over 3 seeds.
-
-Results: see "Experiment results" below.
-
-### Applicability: CIFAR-100 comparison
-
-```bash
-bash examples/run_cifar100_regime.sh            # 4 settings, 3 seeds each
-uv run python examples/summarize.py runs/cifar100_regime.jsonl
-```
-
-- The same TinyResNet underfits more on CIFAR-100 (100 classes). The paper predicts: the more a model underfits, the larger the NetAug gain.
-- 4 settings: baseline, baseline with learning rate 0.2, NetAug with width multipliers 1/2/3, NetAug with width multipliers 1/1.2/1.4. The baseline with learning rate 0.2 checks whether NetAug only doubles the base gradient (see [architecture.en.md Section 8.1](docs/architecture.en.md)).
-- `--grad-log-every N`: every N steps, record the cosine similarity and the norm ratio of the base gradient and the augmented gradient on the base weights.
-- `--amp {bf16,fp16,off}`: the precision of the training forward pass. Use `fp16` on a GPU without bfloat16 (for example the T4). Results with different precisions are listed separately in the tables.
-
-## Experiment results
-
-CIFAR-10, TinyResNet (176,402 parameters), 40 epochs, 3 seeds (0, 1, 2) per configuration. See [docs/report.en.md](docs/report.en.md) for the full setup and discussion.
-
-**Base width (the deployed model)**
-
-| Method | Test acc (%) | Train acc (%) | Paired difference vs. baseline (points) |
-|---|---|---|---|
-| baseline | 86.92 ± 0.35 | 91.90 ± 0.23 | — |
-| netaug | 87.07 ± 0.39 | 92.70 ± 0.20 | +0.15 ± 0.74 |
-| netaug+sort10 | 87.26 ± 0.09 | 92.81 ± 0.23 | +0.34 ± 0.44 |
-
-**Each width: exported from the NetAug model vs. trained alone (test acc %)**
-
-| Width | Parameters | Trained alone | netaug exported | netaug+sort10 exported |
-|---|---|---|---|---|
-| ×1.0 | 176,402 | 86.92 ± 0.35 | 87.07 ± 0.39 | 87.26 ± 0.09 |
-| ×1.5 | 395,350 | 89.27 ± 0.11 | 87.48 ± 0.25 | 88.00 ± 0.13 |
-| ×2.0 | 701,466 | 90.46 ± 0.27 | 88.22 ± 0.16 | 88.48 ± 0.21 |
-| ×3.0 | 1,575,202 | 91.62 ± 0.30 | 88.44 ± 0.18 | 88.50 ± 0.27 |
-
-- The gain for the base model is small, smaller than the variation between seeds; 3 seeds are not enough to show an effect. Train accuracy rises by 0.7–1.3 points for every seed, which matches the "reduce underfitting" mechanism.
-- Wider exported models are worse than models of the same width trained alone; NetAug targets the base model.
-- Sorting never moved a channel into the base (a result of the initialization scale, see section 4 of the report), so `+sort10` has no effect on the base model.
-- Every exported model has an output difference of 0 from the dynamic network.
-
-**Depth augmentation** (1 extra block after the last block of each stage, `--depth 1`)
-
-| Method | Test acc (%) | Train acc (%) | Paired difference vs. baseline (points) |
-|---|---|---|---|
-| Depth augmentation | 86.87 ± 0.20 | 92.28 ± 0.16 | −0.05 ± 0.29 |
-| Width + depth augmentation | 86.96 ± 0.05 | 92.77 ± 0.21 | +0.04 ± 0.34 |
-
-- Depth augmentation has no measurable effect on the base model, and adding depth does not make width augmentation better.
-- The exported network with every extra block on (274,802 parameters) reaches 86.92 ± 0.17, the same as base: the extra blocks are residual copies that start as the identity function and train only when sampled, so they learn almost nothing in 40 epochs.
+On CIFAR-10 and CIFAR-100 (TinyResNet, 40 epochs), NetAug did not significantly improve the test accuracy of the base model. A baseline trained for 40 more epochs (2 times the compute, still less than the about 2.6 times of NetAug in this environment) gave a significant gain of +1.54 percentage points. For the results, observations, and commands to reproduce them, see [docs/experiments.en.md](docs/experiments.en.md). For the project summary and future work, see [summary.en.md](summary.en.md).
 
 ## Citation and references
 

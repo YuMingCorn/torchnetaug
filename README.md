@@ -2,7 +2,9 @@
 
 **繁體中文** | [English](README.en.md)
 
-在純 PyTorch 中實作 **Network Augmentation（NetAug）**，用來提升小模型的準確率。
+在純 PyTorch 中實作 **Network Augmentation（NetAug）**。
+
+> **專案狀態：已結束（2026-11-23）。** 測試顯示實作符合論文的定義，但在本專案的 CIFAR 實驗中，NetAug 沒有顯著提高小模型的測試準確率。見 [summary.md](summary.md)。
 
 NetAug 出自 Han Cai 等人的論文 [*Network Augmentation for Tiny Deep Learning*](https://arxiv.org/abs/2110.08890)（ICLR 2022）。小模型的問題通常是**欠擬合**，不是過擬合。NetAug 在訓練時把小模型嵌進更寬的模型裡一起訓練，讓小模型得到額外的監督訊號。訓練完只匯出小模型，**推論成本不變**。
 
@@ -14,7 +16,7 @@ NetAug 出自 Han Cai 等人的論文 [*Network Augmentation for Tiny Deep Learn
 - **寬度與深度增強**：除了論文的寬度增強，也可以在指定的 block 後面加上額外的 block（深度增強，參考 Once-for-All 的 elastic depth）。
 - **不改你的訓練迴圈**：只要把一行 `loss.backward()` 換成 `netaug_step(...)`。
 
-內部設計與排序方式請看 [docs/architecture.md](docs/architecture.md)；實驗與驗證報告見 [docs/report.md](docs/report.md)；中英術語對照見 [docs/glossary.md](docs/glossary.md)。
+程式碼設計見 [docs/design.md](docs/design.md)；實驗結果見 [docs/experiments.md](docs/experiments.md)；術語對照見 [docs/glossary.md](docs/glossary.md)。
 
 ## 安裝
 
@@ -254,7 +256,7 @@ ema = copy.deepcopy(model)
 model.sort_channels(optimizer=optimizer, extra_models=[ema])
 ```
 
-排序保證**最大寬度**的輸出不變，但會改變 base 的輸出（這正是排序的目的）。所以排序後要繼續訓練，不要在匯出前一刻才排序。原理見 [docs/architecture.md 第 5 節](docs/architecture.md#5-通道排序)。
+排序保證**最大寬度**的輸出不變，但會改變 base 的輸出（這正是排序的目的）。所以排序後要繼續訓練，不要在匯出前一刻才排序。原理見 [docs/design.md 第 5 節](docs/design.md#5-通道排序)。
 
 ### `recalibrate_bn`：重新估計 BN 統計值
 
@@ -369,126 +371,23 @@ print(wrapped.max_sizes)   # [3, 16, 32, 10]
 
 會被增強：`nn.Conv2d`（一般與 depthwise）、`nn.Linear`、BatchNorm，以及它們之間的常見運算（激活函數、池化、殘差相加、SE 相乘、concat、flatten）。
 
-不會被增強（對應的通道維持原寬度，但模型仍然正確）：分組卷積、GroupNorm/LayerNorm、channel shuffle、layer scale 參數、`Conv1d`/`Conv3d` 等。完整清單見 [docs/architecture.md 第 2.2 節](docs/architecture.md#22-白名單分析)。
+不會被增強（對應的通道維持原寬度，但模型仍然正確）：分組卷積、GroupNorm/LayerNorm、channel shuffle、layer scale 參數、`Conv1d`/`Conv3d` 等。完整清單見 [docs/design.md 第 2.2 節](docs/design.md#22-白名單分析)。
 
 最大寬度模型的參數量大約是 base 的 `max(width_mults)²` 倍，例如 `width_mults=(1.0, 2.0, 3.0)` 約 9 倍。深度增強再加上額外 block 的參數。
 
 深度增強只能用在「保持輸入形狀、每次 forward 只執行一次」的 block 上，而且需要 `torch.fx` 追蹤（不能和手動的 `graph=` 一起用）。
 
-## 驗證
-
-### 正確性：自動測試
+## 測試
 
 ```bash
 uv run pytest
 ```
 
-測試在 float64 下以很緊的容差比對，且先把所有參數與 BN 統計值隨機化，避免預設值掩蓋錯誤。涵蓋 8 種模型（自訂卷積鏈、concat 模型、GroupNorm 模型、ResNet18、MobileNetV2、MobileNetV3、ShuffleNetV2、EfficientNet-B0）：
+471 個測試以不經過本套件的普通 PyTorch 模型為基準，檢查 base 模式、每個寬度、一步的梯度（論文 Eq. 2）、排序與匯出。說明見 [docs/design.md 第 9 節](docs/design.md#9-正確性驗證)。
 
-| 驗證的事 | 測試 |
-|---|---|
-| base 模式輸出等於原始模型 | `test_base_mode_equals_original` |
-| 匯出模型是原始類別，形狀相同，輸出等於 base | `test_export_equals_base` |
-| 排序前後最大寬度輸出不變（殘差、concat、SE 都涵蓋） | `test_sort_keeps_max_function` |
-| 排序後的有序性：每個群組的重要度在捨入誤差內非遞增，再排序一次只交換捨入誤差內同分的通道（固定模型、60 個隨機架構、深度增強模型） | `test_sort_orders_importance`、`assert_sorted` |
-| **任意模組組合**：60 個隨機產生的架構，排序或任意排列後最大寬度輸出不變，base 與匯出也正確 | `test_random_architectures.py` |
-| 只排輸出（參考實作的做法）一定會破壞輸出 | `test_sort_only_outputs_breaks_function` |
-| optimizer 狀態跟著正確重排 | `test_permutation_commutes_with_optimizer_step` |
-| 增強網路不污染 BN 統計值 | `test_aug_pass_does_not_touch_bn_stats` |
-| 梯度只流到該流的地方 | `test_netaug_step_gradients` |
-| 每個寬度的參數量、權重形狀、輸出，都等於直接用該寬度建出的普通模型 | `tests/test_widths.py` |
-| 數學證明的前提：白名單每個運算都逐通道獨立（排列與子集都成立），動態層的權重排列引理成立（證明見 [architecture.md 5.6](docs/architecture.md)） | `tests/test_whitelist_lemmas.py` |
-| 1 通道的空間注意力圖不會被加寬；共用權重會被拒絕；MnasNet 能匯出 | `test_one_channel_broadcast_group_is_fixed` 等 |
-| 深度增強：base 與匯出等於原始模型、殘差副本一開始是恆等函數、排序後每個深度的最大寬度輸出不變、`export(sizes, depths)` 等於動態網路、狀態還原、錯誤訊息 | `tests/test_depth.py` |
-| 匯出模型轉成 ONNX 後，onnxruntime 的輸出與 PyTorch 一致（base、×2、隨機寬度） | `tests/test_onnx.py` |
-| 手動設定寬度的動態層網路等於普通網路；含動態層的模型會被明確拒絕；`export(sizes)` 保留 dtype | `tests/test_dynamic_usage.py` |
-| 文件中的範例都能執行（中、英文版） | `tests/test_docs.py` |
+## 實驗結論
 
-### 動態寬度檢查（假資料，不需下載資料集）
-
-```bash
-uv run python examples/check_widths_fake_data.py
-```
-
-這個腳本用 CIFAR 實驗的同一個模型（TinyResNet），在合成資料（10 類，每類一個固定的隨機圖樣加上強雜訊）上檢查：
-
-1. 訓練前與訓練後，x1.0 到 x3.0 每個寬度的參數量與輸出，都等於「直接用該寬度建出的普通 TinyResNet、載入同一份前綴權重」。
-2. 用 `netaug_step` 訓練 400 步，每 100 步排序一次；每次排序前後最大寬度的輸出不變，loss 下降。
-3. 每個寬度各自重新校正 BN 後的測試準確度，以及 `export()` 保持 base 的準確度和大小（176,402 個參數）。
-
-每項檢查印出 PASS 或 FAIL，有任何 FAIL 時結束碼為 1。2026-11-19 在 RTX 3060 Ti 上的結果（全部 PASS）：
-
-| 寬度 | 參數量 | 與普通模型的最大輸出差 | 測試準確度 |
-|---|---|---|---|
-| x1.0（base） | 176,402 | 0 | 67.7% |
-| x1.5 | 395,350 | 0 | 70.7% |
-| x2.0 | 701,466 | 0 | 72.7% |
-| x2.5 | 1,094,750 | 0 | 74.0% |
-| x3.0 | 1,575,202 | 0 | 73.3% |
-
-這只證明每個寬度的「大小與計算」正確、而且都學得起來。合成資料很小，準確度數字不代表 NetAug 的效果；效果要看下面的 CIFAR-10 實驗。
-
-### 效果：CIFAR-10 對照實驗
-
-```bash
-bash examples/run_cifar10_compare.sh            # baseline、NetAug、NetAug + 排序，各 3 個 seed
-bash examples/run_cifar10_depth.sh              # 深度增強、寬度 + 深度增強，各 3 個 seed
-uv run python examples/summarize.py runs/cifar10_compare.jsonl runs/cifar10_depth.jsonl
-```
-
-- 每次執行在 jsonl 檔加一行，記錄 base 模型的測試與訓練準確率。
-- NetAug 的執行另外記錄寬度 ×1.0、×1.5、×2.0、×2.5、×3.0 的測試準確率。每個寬度都在副本上重新校正 BN。×1.5 和 ×2.5 在訓練時沒有被抽到過，用來檢查準確度是否隨寬度平緩變化。
-- 單次執行的差距可能只是雜訊，所以比較 3 個 seed 的平均與標準差。
-
-結果：見下方「實驗結果」。
-
-### 適用範圍：CIFAR-100 對照實驗
-
-```bash
-bash examples/run_cifar100_regime.sh            # 4 組設定，各 3 個 seed
-uv run python examples/summarize.py runs/cifar100_regime.jsonl
-```
-
-- 同一個 TinyResNet 在 CIFAR-100（100 類）上更欠擬合。論文預測：越欠擬合，NetAug 的增益越大。
-- 4 組設定：baseline、baseline 學習率 0.2、NetAug 寬度倍數 1/2/3、NetAug 寬度倍數 1/1.2/1.4。學習率 0.2 的 baseline 用來檢查「NetAug 是否只是把 base 的梯度加倍」（見 [architecture.md 第 8.1 節](docs/architecture.md)）。
-- `--grad-log-every N`：每 N 步記錄 base 權重上 base 梯度與增強梯度的 cosine 相似度與長度比。
-- `--amp {bf16,fp16,off}`：訓練 forward 的精度。沒有 bfloat16 的 GPU（例如 T4）用 `fp16`。不同精度的結果在表中分開列出。
-
-## 實驗結果
-
-CIFAR-10，TinyResNet（176,402 個參數），40 epochs，每種設定 3 個 seed（0、1、2）。完整設定與討論見 [docs/report.md](docs/report.md)。
-
-**base 寬度（部署的模型）**
-
-| 方法 | test acc (%) | train acc (%) | 與 baseline 的配對差異（百分點） |
-|---|---|---|---|
-| baseline | 86.92 ± 0.35 | 91.90 ± 0.23 | — |
-| netaug | 87.07 ± 0.39 | 92.70 ± 0.20 | +0.15 ± 0.74 |
-| netaug+sort10 | 87.26 ± 0.09 | 92.81 ± 0.23 | +0.34 ± 0.44 |
-
-**各寬度：從 NetAug 模型匯出 vs. 單獨訓練（test acc %）**
-
-| 寬度 | 參數量 | 單獨訓練 | netaug 匯出 | netaug+sort10 匯出 |
-|---|---|---|---|---|
-| ×1.0 | 176,402 | 86.92 ± 0.35 | 87.07 ± 0.39 | 87.26 ± 0.09 |
-| ×1.5 | 395,350 | 89.27 ± 0.11 | 87.48 ± 0.25 | 88.00 ± 0.13 |
-| ×2.0 | 701,466 | 90.46 ± 0.27 | 88.22 ± 0.16 | 88.48 ± 0.21 |
-| ×3.0 | 1,575,202 | 91.62 ± 0.30 | 88.44 ± 0.18 | 88.50 ± 0.27 |
-
-- base 模型的增益很小，小於 seed 之間的差異，3 個 seed 不足以判定有效。每個 seed 的訓練準確率都上升 0.7–1.3 個百分點，符合「緩解欠擬合」的機制。
-- 較寬的匯出模型不如同寬度單獨訓練的模型；NetAug 的目標是 base 模型。
-- 排序從未把通道移入 base（初始化尺度造成，見 report 第 4 節），所以 `+sort10` 對 base 沒有作用。
-- 所有匯出模型與動態網路的輸出差異都是 0。
-
-**深度增強**（每個 stage 的最後一個 block 之後加 1 個額外 block，`--depth 1`）
-
-| 方法 | test acc (%) | train acc (%) | 與 baseline 的配對差異（百分點） |
-|---|---|---|---|
-| 深度增強 | 86.87 ± 0.20 | 92.28 ± 0.16 | −0.05 ± 0.29 |
-| 寬度 + 深度增強 | 86.96 ± 0.05 | 92.77 ± 0.21 | +0.04 ± 0.34 |
-
-- 深度增強對 base 模型沒有可測量的效果，加上深度也沒有讓寬度增強變好。
-- 開啟所有額外 block 的匯出網路（274,802 個參數）準確率 86.92 ± 0.17，與 base 相同：額外 block 是從恆等函數開始的殘差副本，只在被抽到時才訓練，40 個 epoch 內幾乎沒有學到東西。
+在 CIFAR-10 與 CIFAR-100（TinyResNet，40 epoch）上，NetAug 都沒有顯著提高 base 模型的測試準確率；baseline 多訓練 40 epoch（2 倍計算量，仍少於本環境中 NetAug 的約 2.6 倍）則有 +1.54 個百分點的顯著增益。結果、觀察與重現指令見 [docs/experiments.md](docs/experiments.md)，專案總結與未來工作見 [summary.md](summary.md)。
 
 ## 引用與參考資料
 
