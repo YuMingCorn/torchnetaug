@@ -4,7 +4,7 @@
 
 以純 PyTorch 實作 [Network Augmentation（NetAug）](https://arxiv.org/abs/2110.08890)（Cai et al., ICLR 2022）。
 
-> **專案已結束（2026-11-23）。** 實作符合論文，但在本專案的 CIFAR 實驗中沒有顯著效果。見 [summary.md](summary.md)。
+> **專案已結束（2026-11-24）。** 實作符合論文，但在本專案的 CIFAR 實驗中沒有顯著效果。見 [summary.md](summary.md)。
 
 ## 重點
 

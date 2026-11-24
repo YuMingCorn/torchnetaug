@@ -39,7 +39,11 @@ testpaths = ["tests"]
 norecursedirs = ["netaug", ".git", ".venv"]
 
 [tool.ruff]
-extend-exclude = ["netaug"]
+line-length = 120
+extend-exclude = ["netaug", ".audit", "*.md"]
+
+[tool.ty.src]
+exclude = ["netaug", ".audit"]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32' or sys_platform == 'linux'" }]

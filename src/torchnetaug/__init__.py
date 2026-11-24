@@ -12,16 +12,16 @@ from .train import netaug_step, recalibrate_bn
 
 __all__ = [
     "ChannelGraph",
-    "LayerRole",
-    "TraceError",
-    "analyze",
-    "check_plain",
     "DepthStack",
     "DynamicBatchNorm",
     "DynamicConv2d",
     "DynamicLinear",
     "DynamicModule",
+    "LayerRole",
     "NetAugModel",
+    "TraceError",
+    "analyze",
+    "check_plain",
     "netaug_step",
     "recalibrate_bn",
 ]

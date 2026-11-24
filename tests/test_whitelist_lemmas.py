@@ -20,8 +20,8 @@ import operator
 
 import pytest
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from torchnetaug import graph as G
 from torchnetaug.layers import DynamicBatchNorm, DynamicConv2d, DynamicLinear
@@ -36,16 +36,31 @@ def _x(shape=(B, C, H, W)):
 # One callable x -> y per whitelisted entry. Dropout runs in eval mode: in training it
 # draws an independent mask per element, so it is separable only in distribution.
 MODULE_CASES = {
-    nn.ReLU: nn.ReLU(), nn.ReLU6: nn.ReLU6(), nn.SiLU: nn.SiLU(), nn.GELU: nn.GELU(),
-    nn.Hardswish: nn.Hardswish(), nn.Hardsigmoid: nn.Hardsigmoid(), nn.Sigmoid: nn.Sigmoid(),
-    nn.Tanh: nn.Tanh(), nn.LeakyReLU: nn.LeakyReLU(0.1), nn.ELU: nn.ELU(), nn.Mish: nn.Mish(),
-    nn.Identity: nn.Identity(), nn.Dropout: nn.Dropout(0.5).eval(),
-    nn.Dropout1d: nn.Dropout1d(0.5).eval(), nn.Dropout2d: nn.Dropout2d(0.5).eval(),
-    nn.Dropout3d: nn.Dropout3d(0.5).eval(), nn.AlphaDropout: nn.AlphaDropout(0.5).eval(),
-    nn.MaxPool1d: nn.MaxPool1d(2), nn.MaxPool2d: nn.MaxPool2d(3, 2, 1),
-    nn.AvgPool1d: nn.AvgPool1d(2), nn.AvgPool2d: nn.AvgPool2d(2),
-    nn.AdaptiveAvgPool1d: nn.AdaptiveAvgPool1d(2), nn.AdaptiveAvgPool2d: nn.AdaptiveAvgPool2d(1),
-    nn.AdaptiveMaxPool1d: nn.AdaptiveMaxPool1d(2), nn.AdaptiveMaxPool2d: nn.AdaptiveMaxPool2d(2),
+    nn.ReLU: nn.ReLU(),
+    nn.ReLU6: nn.ReLU6(),
+    nn.SiLU: nn.SiLU(),
+    nn.GELU: nn.GELU(),
+    nn.Hardswish: nn.Hardswish(),
+    nn.Hardsigmoid: nn.Hardsigmoid(),
+    nn.Sigmoid: nn.Sigmoid(),
+    nn.Tanh: nn.Tanh(),
+    nn.LeakyReLU: nn.LeakyReLU(0.1),
+    nn.ELU: nn.ELU(),
+    nn.Mish: nn.Mish(),
+    nn.Identity: nn.Identity(),
+    nn.Dropout: nn.Dropout(0.5).eval(),
+    nn.Dropout1d: nn.Dropout1d(0.5).eval(),
+    nn.Dropout2d: nn.Dropout2d(0.5).eval(),
+    nn.Dropout3d: nn.Dropout3d(0.5).eval(),
+    nn.AlphaDropout: nn.AlphaDropout(0.5).eval(),
+    nn.MaxPool1d: nn.MaxPool1d(2),
+    nn.MaxPool2d: nn.MaxPool2d(3, 2, 1),
+    nn.AvgPool1d: nn.AvgPool1d(2),
+    nn.AvgPool2d: nn.AvgPool2d(2),
+    nn.AdaptiveAvgPool1d: nn.AdaptiveAvgPool1d(2),
+    nn.AdaptiveAvgPool2d: nn.AdaptiveAvgPool2d(1),
+    nn.AdaptiveMaxPool1d: nn.AdaptiveMaxPool1d(2),
+    nn.AdaptiveMaxPool2d: nn.AdaptiveMaxPool2d(2),
     nn.Upsample: nn.Upsample(scale_factor=2, mode="bilinear"),
     nn.UpsamplingNearest2d: nn.UpsamplingNearest2d(scale_factor=2),
     nn.UpsamplingBilinear2d: nn.UpsamplingBilinear2d(scale_factor=2),
@@ -53,9 +68,18 @@ MODULE_CASES = {
 ONE_D = {nn.MaxPool1d, nn.AvgPool1d, nn.AdaptiveAvgPool1d, nn.AdaptiveMaxPool1d, nn.Dropout1d}
 
 FUNCTION_CASES = {
-    F.relu: F.relu, F.relu_: lambda x: F.relu_(x.clone()), F.relu6: F.relu6, F.silu: F.silu,
-    F.gelu: F.gelu, F.hardswish: F.hardswish, F.hardsigmoid: F.hardsigmoid, F.sigmoid: F.sigmoid,
-    F.tanh: F.tanh, F.leaky_relu: F.leaky_relu, F.elu: F.elu, F.mish: F.mish,
+    F.relu: F.relu,
+    F.relu_: lambda x: F.relu_(x.clone()),
+    F.relu6: F.relu6,
+    F.silu: F.silu,
+    F.gelu: F.gelu,
+    F.hardswish: F.hardswish,
+    F.hardsigmoid: F.hardsigmoid,
+    F.sigmoid: F.sigmoid,
+    F.tanh: F.tanh,
+    F.leaky_relu: F.leaky_relu,
+    F.elu: F.elu,
+    F.mish: F.mish,
     F.dropout: lambda x: F.dropout(x, 0.5, training=False),
     F.dropout1d: lambda x: F.dropout1d(x.flatten(2), 0.5, training=False),
     F.dropout2d: lambda x: F.dropout2d(x, 0.5, training=False),
@@ -69,9 +93,12 @@ FUNCTION_CASES = {
     F.adaptive_max_pool1d: lambda x: F.adaptive_max_pool1d(x.flatten(2), 3),
     F.adaptive_max_pool2d: lambda x: F.adaptive_max_pool2d(x, 2),
     F.interpolate: lambda x: F.interpolate(x, scale_factor=2, mode="bicubic"),
-    torch.relu: torch.relu, torch.relu_: lambda x: torch.relu_(x.clone()),
-    torch.sigmoid: torch.sigmoid, torch.tanh: torch.tanh,
-    torch.clamp: lambda x: torch.clamp(x, -0.5, 0.5), torch.clip: lambda x: torch.clip(x, -0.5, 0.5),
+    torch.relu: torch.relu,
+    torch.relu_: lambda x: torch.relu_(x.clone()),
+    torch.sigmoid: torch.sigmoid,
+    torch.tanh: torch.tanh,
+    torch.clamp: lambda x: torch.clamp(x, -0.5, 0.5),
+    torch.clip: lambda x: torch.clip(x, -0.5, 0.5),
 }
 try:
     from torchvision.ops import stochastic_depth
@@ -82,11 +109,13 @@ try:
 except ImportError:  # pragma: no cover
     pass
 
-METHOD_CASES = {name: (lambda name: lambda x: getattr(x.clone(), name)())(name)
-                for name in ["relu", "relu_", "sigmoid", "sigmoid_", "tanh", "tanh_",
-                             "contiguous", "clone", "detach"]}
-METHOD_CASES.update({name: (lambda name: lambda x: getattr(x.clone(), name)(-0.5, 0.5))(name)
-                     for name in ["clamp", "clamp_", "clip", "clip_"]})
+METHOD_CASES = {
+    name: (lambda x, name=name: getattr(x.clone(), name)())
+    for name in ["relu", "relu_", "sigmoid", "sigmoid_", "tanh", "tanh_", "contiguous", "clone", "detach"]
+}
+METHOD_CASES.update(
+    {name: (lambda x, name=name: getattr(x.clone(), name)(-0.5, 0.5)) for name in ["clamp", "clamp_", "clip", "clip_"]}
+)
 
 # Reshapes and reductions pass channels only when dims 0 and 1 are unchanged; these are
 # the shapes the analyser accepts (e.g. flatten after global pooling).
@@ -98,9 +127,12 @@ RESHAPE_CASES = {
     "torch.reshape": lambda x: torch.reshape(x, (x.shape[0], x.shape[1], -1)),
     "squeeze": lambda x: x.mean([2, 3], keepdim=True).squeeze(-1),
     "torch.squeeze": lambda x: torch.squeeze(x.mean(3, keepdim=True), 3),
-    "mean": lambda x: x.mean([2, 3]), "torch.mean": lambda x: torch.mean(x, (2, 3), keepdim=True),
-    "sum": lambda x: x.sum(2), "torch.sum": lambda x: torch.sum(x, [2, 3]),
-    "amax": lambda x: x.amax(3), "torch.amax": lambda x: torch.amax(x, (2, 3)),
+    "mean": lambda x: x.mean([2, 3]),
+    "torch.mean": lambda x: torch.mean(x, (2, 3), keepdim=True),
+    "sum": lambda x: x.sum(2),
+    "torch.sum": lambda x: torch.sum(x, [2, 3]),
+    "amax": lambda x: x.amax(3),
+    "torch.amax": lambda x: torch.amax(x, (2, 3)),
 }
 
 BINARY_FUNCS = sorted(G._BINARY_FUNCTIONS, key=repr) + sorted(G._BINARY_METHODS)
@@ -189,6 +221,7 @@ def test_dense_conv_lemma():
     x = _x((B, 5, H, W))
     p_in, p_out = torch.randperm(5), torch.randperm(6)
     y = conv(x)
+    assert conv.bias is not None
     with torch.no_grad():
         conv.weight.copy_(conv.weight[p_out][:, p_in])
         conv.bias.copy_(conv.bias[p_out])
@@ -200,6 +233,7 @@ def test_depthwise_conv_lemma():
     x = _x((B, 6, H, W))
     p = torch.randperm(6)
     y = conv(x)
+    assert conv.bias is not None
     with torch.no_grad():
         conv.weight.copy_(conv.weight[p])
         conv.bias.copy_(conv.bias[p])
@@ -220,6 +254,7 @@ def test_linear_lemma():
 @pytest.mark.parametrize("training", [False, True])
 def test_batchnorm_lemma(training):
     bn = DynamicBatchNorm(6)
+    assert bn.weight is not None and bn.bias is not None and bn.running_mean is not None and bn.running_var is not None
     with torch.no_grad():
         for t in (bn.weight, bn.bias, bn.running_mean):
             t.normal_()
@@ -234,6 +269,7 @@ def test_batchnorm_lemma(training):
     with torch.no_grad():
         for name in ("weight", "bias", "running_mean", "running_var"):
             getattr(bn, name).copy_(getattr(bn, name)[p])
+    assert ref.running_mean is not None and ref.running_var is not None
     torch.testing.assert_close(bn(x[:, p]), y[:, p])
     torch.testing.assert_close(bn.running_mean, ref.running_mean[p])
     torch.testing.assert_close(bn.running_var, ref.running_var[p])

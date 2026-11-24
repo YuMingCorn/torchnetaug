@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import random
 import warnings
+from typing import Any, cast
 
 import pytest
 import torch
@@ -32,9 +33,11 @@ def _to_onnx(model: torch.nn.Module, x: torch.Tensor, dynamo: bool) -> bytes:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         if dynamo:
-            return torch.onnx.export(model, (x,), dynamo=True, verbose=False).model_proto.SerializeToString()
+            prog = torch.onnx.export(model, (x,), dynamo=True, verbose=False)
+            assert prog is not None
+            return prog.model_proto.SerializeToString()
         f = io.BytesIO()
-        torch.onnx.export(model, (x,), f, dynamo=False, opset_version=17)
+        torch.onnx.export(model, (x,), cast(Any, f), dynamo=False, opset_version=17)
         return f.getvalue()
 
 

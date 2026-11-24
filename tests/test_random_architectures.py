@@ -11,11 +11,10 @@ import random
 
 import pytest
 import torch
-import torch.nn as nn
+from conftest import assert_sorted, randomize
+from torch import nn
 
 from torchnetaug import NetAugModel
-
-from conftest import assert_sorted, randomize
 
 ACTS = [nn.ReLU, nn.SiLU, nn.Hardswish, nn.Sigmoid, nn.Tanh, nn.GELU, nn.ReLU6]
 N_SEEDS = 60
@@ -52,8 +51,25 @@ class RandomNet(nn.Module):
 
         conv(0)  # make sure there is at least one free group
         for _ in range(n_ops):
-            op = rng.choice(["conv", "conv", "dw", "bn", "act", "pool", "add", "add", "se", "cat",
-                             "gn", "gconv", "scale", "slice", "shuffle"])
+            op = rng.choice(
+                [
+                    "conv",
+                    "conv",
+                    "dw",
+                    "bn",
+                    "act",
+                    "pool",
+                    "add",
+                    "add",
+                    "se",
+                    "cat",
+                    "gn",
+                    "gconv",
+                    "scale",
+                    "slice",
+                    "shuffle",
+                ]
+            )
             src = pick()
             c = chans[src]
             if op == "conv":
@@ -125,7 +141,7 @@ class RandomNet(nn.Module):
     def forward(self, x):
         feats = [x]
         for kind, ins, name in self.plan:
-            if kind == "mod":
+            if kind == "mod" and name is not None:
                 feats.append(self.mods[name](feats[ins[0]]))
             elif kind == "add":
                 feats.append(feats[ins[0]] + feats[ins[1]])
@@ -133,7 +149,7 @@ class RandomNet(nn.Module):
                 feats.append(feats[ins[0]] * feats[ins[1]])
             elif kind == "cat":
                 feats.append(torch.cat([feats[i] for i in ins], dim=1))
-            elif kind == "scale":
+            elif kind == "scale" and name is not None:
                 feats.append(feats[ins[0]] * self.params[name])
             elif kind == "slice":
                 t = feats[ins[0]]

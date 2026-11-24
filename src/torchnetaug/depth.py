@@ -21,11 +21,10 @@ Users do not build :class:`DepthStack` by hand: pass ``depth={...}`` to ``NetAug
 from __future__ import annotations
 
 import copy
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 import torch
-import torch.fx as fx
-import torch.nn as nn
+from torch import fx, nn
 
 __all__ = ["DepthStack", "tie_channels"]
 
@@ -44,7 +43,7 @@ class DepthStack(nn.Module):
     ``active == 0`` computes exactly ``block(x)``.
     """
 
-    def __init__(self, block: nn.Module, extras: List[nn.Module]) -> None:
+    def __init__(self, block: nn.Module, extras: list[nn.Module]) -> None:
         super().__init__()
         self.block = block
         self.extra = nn.ModuleList(extras)
@@ -74,7 +73,7 @@ def _reset(module: nn.Module) -> None:
 
 
 @torch.no_grad()
-def make_extra(block: nn.Module, example: Optional[torch.Tensor]) -> Tuple[nn.Module, Optional[str]]:
+def make_extra(block: nn.Module, example: torch.Tensor | None) -> tuple[nn.Module, str | None]:
     """A copy of ``block`` with new weights; identity at start when ``block`` is residual.
 
     The last batch norm of the copy gets weight 0. If the copy then returns its input
@@ -87,8 +86,7 @@ def make_extra(block: nn.Module, example: Optional[torch.Tensor]) -> Tuple[nn.Mo
     """
     extra = copy.deepcopy(block)
     _reset(extra)
-    norms = [(n, m) for n, m in extra.named_modules()
-             if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.affine]
+    norms = [(n, m) for n, m in extra.named_modules() if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.affine]
     if not norms or example is None or example.numel() == 0:
         return extra, None
     probe = example
@@ -96,12 +94,14 @@ def make_extra(block: nn.Module, example: Optional[torch.Tensor]) -> Tuple[nn.Mo
         # A zero input (e.g. tracing with torch.zeros) cannot distinguish f(x)=x from f(x)=0.
         # Use a positive probe so post-ReLU residual blocks (BasicBlock) still pass f(x)=x.
         g = torch.Generator(device="cpu").manual_seed(0)
-        probe = torch.rand(example.shape, generator=g, dtype=torch.float32).to(
-            device=example.device, dtype=example.dtype
-        ) + 0.5
+        probe = (
+            torch.rand(example.shape, generator=g, dtype=torch.float32).to(device=example.device, dtype=example.dtype)
+            + 0.5
+        )
     candidate = copy.deepcopy(extra)
-    last_name, last = [(n, m) for n, m in candidate.named_modules()
-                       if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.affine][-1]
+    last_name, last = [
+        (n, m) for n, m in candidate.named_modules() if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.affine
+    ][-1]
     last.weight.zero_()
     last.bias.zero_()
     flags = [(m, m.training) for m in candidate.modules()]  # keep per-module flags
@@ -109,8 +109,10 @@ def make_extra(block: nn.Module, example: Optional[torch.Tensor]) -> Tuple[nn.Mo
     out: Any = candidate(probe)
     for m, flag in flags:
         m.training = flag
-    if isinstance(out, torch.Tensor) and out.shape == probe.shape and torch.allclose(
-        out.float(), probe.float(), rtol=1e-5, atol=1e-6
+    if (
+        isinstance(out, torch.Tensor)
+        and out.shape == probe.shape
+        and torch.allclose(out.float(), probe.float(), rtol=1e-5, atol=1e-6)
     ):
         return candidate, last_name
     return extra, None

@@ -23,19 +23,19 @@ from __future__ import annotations
 import copy
 import math
 import operator
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
 
 import torch
-import torch.fx as fx
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import fx, nn
 from torch.fx.passes.shape_prop import ShapeProp, TensorMetadata
 
 from .depth import DepthStack, tie_channels
 from .layers import DynamicModule
 
-__all__ = ["LayerRole", "ChannelGraph", "analyze", "check_plain", "TraceError"]
+__all__ = ["ChannelGraph", "LayerRole", "TraceError", "analyze", "check_plain"]
 
 
 class TraceError(RuntimeError):
@@ -55,24 +55,24 @@ class LayerRole:
     """
 
     kind: str
-    in_groups: Tuple[int, ...]
-    out_group: Optional[int] = None
+    in_groups: tuple[int, ...]
+    out_group: int | None = None
 
 
 @dataclass
 class ChannelGraph:
     """Result of the analysis: group sizes, which groups are fixed, and each layer's role."""
 
-    group_sizes: List[int]
-    group_fixed: List[bool]
-    layers: Dict[str, LayerRole]
-    fixed_reasons: Dict[int, List[str]] = field(default_factory=dict)
+    group_sizes: list[int]
+    group_fixed: list[bool]
+    layers: dict[str, LayerRole]
+    fixed_reasons: dict[int, list[str]] = field(default_factory=dict)
 
     @property
     def num_groups(self) -> int:
         return len(self.group_sizes)
 
-    def free_groups(self) -> List[int]:
+    def free_groups(self) -> list[int]:
         return [g for g, fixed in enumerate(self.group_fixed) if not fixed]
 
     def summary(self) -> str:
@@ -92,21 +92,68 @@ class ChannelGraph:
 # --------------------------------------------------------------------------------------
 
 _PASSTHROUGH_MODULES = (
-    nn.ReLU, nn.ReLU6, nn.SiLU, nn.GELU, nn.Hardswish, nn.Hardsigmoid, nn.Sigmoid,
-    nn.Tanh, nn.LeakyReLU, nn.ELU, nn.Mish, nn.Identity, nn.Dropout, nn.Dropout1d,
-    nn.Dropout2d, nn.Dropout3d, nn.AlphaDropout, nn.MaxPool1d, nn.MaxPool2d,
-    nn.AvgPool1d, nn.AvgPool2d, nn.AdaptiveAvgPool1d, nn.AdaptiveAvgPool2d,
-    nn.AdaptiveMaxPool1d, nn.AdaptiveMaxPool2d, nn.Upsample, nn.UpsamplingNearest2d,
+    nn.ReLU,
+    nn.ReLU6,
+    nn.SiLU,
+    nn.GELU,
+    nn.Hardswish,
+    nn.Hardsigmoid,
+    nn.Sigmoid,
+    nn.Tanh,
+    nn.LeakyReLU,
+    nn.ELU,
+    nn.Mish,
+    nn.Identity,
+    nn.Dropout,
+    nn.Dropout1d,
+    nn.Dropout2d,
+    nn.Dropout3d,
+    nn.AlphaDropout,
+    nn.MaxPool1d,
+    nn.MaxPool2d,
+    nn.AvgPool1d,
+    nn.AvgPool2d,
+    nn.AdaptiveAvgPool1d,
+    nn.AdaptiveAvgPool2d,
+    nn.AdaptiveMaxPool1d,
+    nn.AdaptiveMaxPool2d,
+    nn.Upsample,
+    nn.UpsamplingNearest2d,
     nn.UpsamplingBilinear2d,
 )
 
 _PASSTHROUGH_FUNCTIONS = {
-    F.relu, F.relu_, F.relu6, F.silu, F.gelu, F.hardswish, F.hardsigmoid, F.sigmoid,
-    F.tanh, F.leaky_relu, F.elu, F.mish, F.dropout, F.dropout1d, F.dropout2d,
-    F.dropout3d, F.max_pool1d, F.max_pool2d, F.avg_pool1d, F.avg_pool2d,
-    F.adaptive_avg_pool1d, F.adaptive_avg_pool2d, F.adaptive_max_pool1d,
-    F.adaptive_max_pool2d, F.interpolate, torch.relu, torch.relu_, torch.sigmoid,
-    torch.tanh, torch.clamp, torch.clip,
+    F.relu,
+    F.relu_,
+    F.relu6,
+    F.silu,
+    F.gelu,
+    F.hardswish,
+    F.hardsigmoid,
+    F.sigmoid,
+    F.tanh,
+    F.leaky_relu,
+    F.elu,
+    F.mish,
+    F.dropout,
+    F.dropout1d,
+    F.dropout2d,
+    F.dropout3d,
+    F.max_pool1d,
+    F.max_pool2d,
+    F.avg_pool1d,
+    F.avg_pool2d,
+    F.adaptive_avg_pool1d,
+    F.adaptive_avg_pool2d,
+    F.adaptive_max_pool1d,
+    F.adaptive_max_pool2d,
+    F.interpolate,
+    torch.relu,
+    torch.relu_,
+    torch.sigmoid,
+    torch.tanh,
+    torch.clamp,
+    torch.clip,
 }
 
 try:  # stochastic depth drops whole samples or rows, never single channels
@@ -120,17 +167,37 @@ except ImportError:  # pragma: no cover - torchvision is optional
 _METADATA_METHODS = {"size", "dim", "numel"}
 
 _PASSTHROUGH_METHODS = {
-    "relu", "relu_", "sigmoid", "sigmoid_", "tanh", "tanh_", "contiguous", "clone",
-    "clamp", "clamp_", "clip", "clip_", "detach",
+    "relu",
+    "relu_",
+    "sigmoid",
+    "sigmoid_",
+    "tanh",
+    "tanh_",
+    "contiguous",
+    "clone",
+    "clamp",
+    "clamp_",
+    "clip",
+    "clip_",
+    "detach",
 }
 
 _RESHAPE_FUNCTIONS = {torch.flatten, torch.reshape, torch.squeeze}
 _RESHAPE_METHODS = {"flatten", "view", "reshape", "squeeze"}
 
 _BINARY_FUNCTIONS = {
-    operator.add, operator.iadd, operator.sub, operator.isub, operator.mul,
-    operator.imul, operator.truediv, operator.itruediv, torch.add, torch.sub,
-    torch.mul, torch.div,
+    operator.add,
+    operator.iadd,
+    operator.sub,
+    operator.isub,
+    operator.mul,
+    operator.imul,
+    operator.truediv,
+    operator.itruediv,
+    torch.add,
+    torch.sub,
+    torch.mul,
+    torch.div,
 }
 _BINARY_METHODS = {"add", "add_", "sub", "sub_", "mul", "mul_", "div", "div_"}
 
@@ -143,10 +210,10 @@ _MEAN_METHODS = {"mean", "amax", "sum"}
 # analysis
 # --------------------------------------------------------------------------------------
 
-Spec = Tuple[int, ...]  # ordered group ids along the channel dimension (dim 1)
+Spec = tuple[int, ...]  # ordered group ids along the channel dimension (dim 1)
 
 
-def _shape(node: Any) -> Optional[torch.Size]:
+def _shape(node: Any) -> torch.Size | None:
     if not isinstance(node, fx.Node):
         return None
     meta = node.meta.get("tensor_meta")
@@ -159,15 +226,15 @@ class _Analyzer:
     def __init__(self, gm: fx.GraphModule) -> None:
         self.gm = gm
         self.modules = dict(gm.named_modules())
-        self.parent: List[int] = []
-        self.size: List[int] = []
-        self.fixed: List[bool] = []
-        self.reasons: Dict[int, List[str]] = {}
-        self.spec: Dict[fx.Node, Spec] = {}
-        self.layers: Dict[str, LayerRole] = {}
-        self.call_count: Dict[str, int] = {}
+        self.parent: list[int] = []
+        self.size: list[int] = []
+        self.fixed: list[bool] = []
+        self.reasons: dict[int, list[str]] = {}
+        self.spec: dict[fx.Node, Spec] = {}
+        self.layers: dict[str, LayerRole] = {}
+        self.call_count: dict[str, int] = {}
         for node in gm.graph.nodes:
-            if node.op == "call_module":
+            if node.op == "call_module" and isinstance(node.target, str):
                 self.call_count[node.target] = self.call_count.get(node.target, 0) + 1
 
     # ---- union-find --------------------------------------------------------------
@@ -196,7 +263,7 @@ class _Analyzer:
         self.fixed[ra] = self.fixed[ra] or self.fixed[rb]
         self.reasons.setdefault(ra, []).extend(self.reasons.pop(rb, []))
 
-    def fix(self, spec: Optional[Spec], reason: str) -> None:
+    def fix(self, spec: Spec | None, reason: str) -> None:
         for g in spec or ():
             r = self.find(g)
             self.fixed[r] = True
@@ -206,7 +273,7 @@ class _Analyzer:
         return sum(self.size[self.find(g)] for g in spec)
 
     # ---- helpers -----------------------------------------------------------------
-    def input_specs(self, node: fx.Node) -> List[Spec]:
+    def input_specs(self, node: fx.Node) -> list[Spec]:
         return [self.spec[n] for n in node.all_input_nodes if n in self.spec]
 
     def opaque(self, node: fx.Node, reason: str) -> None:
@@ -220,9 +287,14 @@ class _Analyzer:
     def passthrough(self, node: fx.Node, src: Any) -> None:
         shape, src_shape = _shape(node), _shape(src)
         if (
-            isinstance(src, fx.Node) and src in self.spec and shape is not None
-            and src_shape is not None and len(shape) >= 2 and len(src_shape) >= 2
-            and shape[0] == src_shape[0] and shape[1] == src_shape[1]
+            isinstance(src, fx.Node)
+            and src in self.spec
+            and shape is not None
+            and src_shape is not None
+            and len(shape) >= 2
+            and len(src_shape) >= 2
+            and shape[0] == src_shape[0]
+            and shape[1] == src_shape[1]
         ):
             for other in node.all_input_nodes:
                 if other is src:
@@ -273,7 +345,7 @@ class _Analyzer:
                     self.fix(s, "model output")
 
     def call_module(self, node: fx.Node) -> None:
-        name = node.target
+        name = str(node.target)
         mod = self.modules[name]
         x = node.args[0] if node.args else None
         in_spec = self.spec.get(x) if isinstance(x, fx.Node) else None
@@ -312,14 +384,16 @@ class _Analyzer:
             self.spec[node] = (g,)
         else:  # batch norm
             if c_in != mod.num_features or type(mod) not in (
-                nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
+                nn.BatchNorm1d,
+                nn.BatchNorm2d,
+                nn.BatchNorm3d,
             ):
                 return self.opaque(node, f"unsupported norm {name}")
             self.layers[name] = LayerRole("member", in_spec)
             self.spec[node] = in_spec
 
     @staticmethod
-    def _dim_read(arg: Any) -> Optional[Tuple[fx.Node, int]]:
+    def _dim_read(arg: Any) -> tuple[fx.Node, int] | None:
         """If ``arg`` reads one dimension ``d`` of a tensor node ``src``, return ``(src, d)``."""
         if not isinstance(arg, fx.Node):
             return None
@@ -336,9 +410,9 @@ class _Analyzer:
             if not (isinstance(seq, fx.Node) and isinstance(idx, int) and not isinstance(idx, bool)):
                 return None
             src = None
-            if seq.op == "call_function" and seq.target is getattr and len(seq.args) == 2 and seq.args[1] == "shape":
-                src = seq.args[0]
-            elif seq.op == "call_method" and seq.target == "size" and len(seq.args) == 1 and not seq.kwargs:
+            if (
+                seq.op == "call_function" and seq.target is getattr and len(seq.args) == 2 and seq.args[1] == "shape"
+            ) or (seq.op == "call_method" and seq.target == "size" and len(seq.args) == 1 and not seq.kwargs):
                 src = seq.args[0]
             if isinstance(src, fx.Node):
                 src_s = _shape(src)
@@ -361,9 +435,17 @@ class _Analyzer:
         read = self._dim_read(arg)
         if read is not None:
             return read[1] != 1
-        if arg.op == "call_function" and arg.target in (
-            operator.mul, operator.floordiv, operator.add, operator.sub,
-        ) and not arg.kwargs:
+        if (
+            arg.op == "call_function"
+            and arg.target
+            in (
+                operator.mul,
+                operator.floordiv,
+                operator.add,
+                operator.sub,
+            )
+            and not arg.kwargs
+        ):
             return all(self._is_non_channel_expr(a, depth + 1) for a in arg.args)
         return False
 
@@ -380,8 +462,10 @@ class _Analyzer:
             start_dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("start_dim", 0)
             end_dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("end_dim", -1)
             if not (
-                isinstance(start_dim, int) and not isinstance(start_dim, bool)
-                and isinstance(end_dim, int) and not isinstance(end_dim, bool)
+                isinstance(start_dim, int)
+                and not isinstance(start_dim, bool)
+                and isinstance(end_dim, int)
+                and not isinstance(end_dim, bool)
             ):
                 return False
             start, end = start_dim % len(s), end_dim % len(s)
@@ -393,7 +477,7 @@ class _Analyzer:
             if isinstance(dim, int) and not isinstance(dim, bool):
                 return (dim % len(s)) >= 2
             if isinstance(dim, (tuple, list)) and all(isinstance(d, int) and not isinstance(d, bool) for d in dim):
-                return all((d % len(s)) >= 2 for d in dim)
+                return all((d % len(s)) >= 2 for d in dim if isinstance(d, int))
             return False
         # view / reshape: output dim 1 must adapt to the channel count (-1 or x.size(1)/x.shape[1]),
         # and no other dimension may depend on a channel dimension.
@@ -405,7 +489,9 @@ class _Analyzer:
         else:
             if node.kwargs:
                 if (
-                    t == "reshape" and set(node.kwargs) == {"shape"} and len(node.args) == 1
+                    t == "reshape"
+                    and set(node.kwargs) == {"shape"}
+                    and len(node.args) == 1
                     and isinstance(node.kwargs["shape"], (tuple, list))
                 ):
                     shape_args = list(node.kwargs["shape"])
@@ -429,9 +515,15 @@ class _Analyzer:
         """Keep the channel groups if dim 0 and dim 1 stay dynamically unchanged."""
         s, o = _shape(x), _shape(node)
         if (
-            isinstance(x, fx.Node) and x in self.spec
-            and s is not None and o is not None and len(s) >= 2 and len(o) >= 2
-            and s[0] == o[0] and s[1] == o[1] and math.prod(s[2:]) == math.prod(o[2:])
+            isinstance(x, fx.Node)
+            and x in self.spec
+            and s is not None
+            and o is not None
+            and len(s) >= 2
+            and len(o) >= 2
+            and s[0] == o[0]
+            and s[1] == o[1]
+            and math.prod(s[2:]) == math.prod(o[2:])
             and self._reshape_preserves_channels(node, x, s, o)
         ):
             return self.passthrough(node, x)
@@ -446,7 +538,7 @@ class _Analyzer:
             return self.tie(node)
         if (not is_method and t in _BINARY_FUNCTIONS) or (is_method and t in _BINARY_METHODS):
             return self.binary(node)
-        if (not is_method and t in _CAT_FUNCTIONS):
+        if not is_method and t in _CAT_FUNCTIONS:
             return self.cat(node)
         if (not is_method and t in _PASSTHROUGH_FUNCTIONS) or (is_method and t in _PASSTHROUGH_METHODS):
             src = node.args[0] if node.args else node.kwargs.get("input")
@@ -456,9 +548,8 @@ class _Analyzer:
             return self.reshape_like(node, src)
         if (not is_method and t in _MEAN_FUNCTIONS) or (is_method and t in _MEAN_METHODS):
             return self.reduce(node)
-        if (is_method and t in _METADATA_METHODS) or (not is_method and t is getattr):
-            if out_shape is None:
-                return  # metadata read such as x.size(0) or x.shape
+        if ((is_method and t in _METADATA_METHODS) or (not is_method and t is getattr)) and out_shape is None:
+            return  # metadata read such as x.size(0) or x.shape
         if out_shape is None and not self.input_specs(node):
             return  # other non-tensor helper
         self.opaque(node, f"unsupported op {getattr(t, '__name__', t)} ({node.name})")
@@ -467,7 +558,7 @@ class _Analyzer:
         out = _shape(node)
         if out is None or len(out) < 2:
             return self.opaque(node, f"non-channel binary op {node.name}")
-        participants: List[Spec] = []
+        participants: list[Spec] = []
         for arg in list(node.args[:2]) + list(node.kwargs.values()):
             if not isinstance(arg, fx.Node):
                 continue  # python scalar
@@ -493,7 +584,7 @@ class _Analyzer:
     def tie(self, node: fx.Node) -> None:
         """``tie_channels(x, ref)``: ``x`` and ``ref`` are one channel group (depth extras)."""
         x, ref = node.args[0], node.args[1]
-        if not all(isinstance(a, fx.Node) and a in self.spec for a in (x, ref)):
+        if not (isinstance(x, fx.Node) and x in self.spec and isinstance(ref, fx.Node) and ref in self.spec):
             return self.opaque(node, f"tie with unknown input {node.name}")
         self.spec[node] = self.merge_specs(node, [self.spec[ref], self.spec[x]])
 
@@ -501,12 +592,13 @@ class _Analyzer:
         tensors = node.args[0]
         dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
         out = _shape(node)
-        if out is None or not isinstance(tensors, (list, tuple)):
+        if out is None or not isinstance(tensors, (list, tuple)) or not isinstance(dim, int) or isinstance(dim, bool):
             return self.opaque(node, f"unsupported cat {node.name}")
         dim = dim % len(out)
-        if not all(isinstance(a, fx.Node) and a in self.spec for a in tensors):
+        nodes = [a for a in tensors if isinstance(a, fx.Node) and a in self.spec]
+        if len(nodes) != len(tensors):
             return self.opaque(node, f"cat with unknown input {node.name}")
-        specs = [self.spec[a] for a in tensors]
+        specs = [self.spec[a] for a in nodes]
         if dim == 1:
             self.spec[node] = tuple(g for s in specs for g in s)
         elif dim >= 2:
@@ -521,19 +613,19 @@ class _Analyzer:
         if s is None or dims is None:
             return self.opaque(node, f"full reduction {node.name}")
         if isinstance(dims, int) and not isinstance(dims, bool):
-            dims = [dims]
+            dim_list = [dims]
         elif isinstance(dims, (tuple, list)) and all(isinstance(d, int) and not isinstance(d, bool) for d in dims):
-            dims = list(dims)
+            dim_list = [d for d in dims if isinstance(d, int)]
         else:
             return self.opaque(node, f"dynamic reduction {node.name}")
-        dims = [d % len(s) for d in dims]
-        if 0 in dims or 1 in dims:
+        dim_list = [d % len(s) for d in dim_list]
+        if 0 in dim_list or 1 in dim_list:
             return self.opaque(node, f"reduction over channels {node.name}")
         self.passthrough(node, x)
 
     # ---- result ------------------------------------------------------------------
     def result(self) -> ChannelGraph:
-        roots: Dict[int, int] = {}
+        roots: dict[int, int] = {}
         for g in range(len(self.parent)):
             r = self.find(g)
             if r not in roots:
@@ -544,15 +636,16 @@ class _Analyzer:
 
         sizes = [0] * len(roots)
         fixed = [False] * len(roots)
-        reasons: Dict[int, List[str]] = {}
+        reasons: dict[int, list[str]] = {}
         for r, i in roots.items():
             sizes[i] = self.size[r]
             fixed[i] = self.fixed[r]
             if self.reasons.get(r):
                 reasons[i] = list(self.reasons[r])
         layers = {
-            name: LayerRole(role.kind, tuple(m(g) for g in role.in_groups),
-                            None if role.out_group is None else m(role.out_group))
+            name: LayerRole(
+                role.kind, tuple(m(g) for g in role.in_groups), None if role.out_group is None else m(role.out_group)
+            )
             for name, role in self.layers.items()
         }
         return ChannelGraph(sizes, fixed, layers, reasons)
@@ -575,7 +668,7 @@ def check_plain(model: nn.Module, allow_depth: bool = False) -> None:
             )
 
 
-def analyze(model: nn.Module, example_inputs: Any, tracer: Optional[fx.Tracer] = None) -> ChannelGraph:
+def analyze(model: nn.Module, example_inputs: Any, tracer: fx.Tracer | None = None) -> ChannelGraph:
     """Trace ``model`` with ``torch.fx`` and find its channel groups.
 
     ``example_inputs`` is a tensor or a tuple of tensors used to propagate shapes. The model
@@ -590,7 +683,7 @@ def analyze(model: nn.Module, example_inputs: Any, tracer: Optional[fx.Tracer] =
         else:
             graph = tracer.trace(model)
             gm = fx.GraphModule(tracer.root, graph)
-    except Exception as e:  # noqa: BLE001 - torch.fx raises many exception types
+    except Exception as e:
         raise TraceError(
             "torch.fx could not trace this model. Remove data-dependent control flow from "
             "forward(), pass a custom tracer, or build a torchnetaug.ChannelGraph by hand.\n"

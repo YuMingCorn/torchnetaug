@@ -12,19 +12,19 @@ channels, always a prefix of the max-width output dimension.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Tuple
+from collections.abc import Sequence
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
-Segments = Tuple[Tuple[int, int], ...]
+Segments = tuple[tuple[int, int], ...]
 
 __all__ = [
-    "DynamicModule",
+    "DynamicBatchNorm",
     "DynamicConv2d",
     "DynamicLinear",
-    "DynamicBatchNorm",
+    "DynamicModule",
     "segments_index",
 ]
 
@@ -45,12 +45,13 @@ class DynamicModule(nn.Module):
     """Mixin with the shared segment-selection logic."""
 
     in_segments: Segments
+    active_out: int
 
     def _init_dynamic(self, in_size: int) -> None:
         self.in_segments = ((0, in_size),)
         self._index_cache: dict = {}
 
-    def set_in_segments(self, segments: Sequence[Tuple[int, int]]) -> None:
+    def set_in_segments(self, segments: Sequence[tuple[int, int]]) -> None:
         self.in_segments = tuple((int(o), int(a)) for o, a in segments)
         self._index_cache = {}
 
@@ -95,7 +96,7 @@ class DynamicConv2d(DynamicModule, nn.Conv2d):
         self._init_dynamic(self.in_channels)
         self.active_out = self.out_channels
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.depthwise:
             weight = self._select_in(self.weight, 0)
             bias = None if self.bias is None else self._select_in(self.bias, 0)
@@ -105,18 +106,18 @@ class DynamicConv2d(DynamicModule, nn.Conv2d):
             bias = None if self.bias is None else self.bias[: self.active_out]
             groups = 1
         if self.padding_mode != "zeros":
-            x = F.pad(x, self._reversed_padding_repeated_twice, mode=self.padding_mode)
+            input = F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode)
             padding = 0
         else:
             padding = self.padding
-        return F.conv2d(x, weight, bias, self.stride, padding, self.dilation, groups)
+        return F.conv2d(input, weight, bias, self.stride, padding, self.dilation, groups)
 
     def active_weight(self) -> torch.Tensor:
         if self.depthwise:
             return self._select_in(self.weight, 0)
         return self._select_in(self.weight[: self.active_out], 1)
 
-    def active_bias(self) -> Optional[torch.Tensor]:
+    def active_bias(self) -> torch.Tensor | None:
         if self.bias is None:
             return None
         return self._select_in(self.bias, 0) if self.depthwise else self.bias[: self.active_out]
@@ -130,13 +131,13 @@ class DynamicLinear(DynamicModule, nn.Linear):
         self._init_dynamic(self.in_features)
         self.active_out = self.out_features
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.active_weight(), self.active_bias())
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.linear(input, self.active_weight(), self.active_bias())
 
     def active_weight(self) -> torch.Tensor:
         return self._select_in(self.weight[: self.active_out], 1)
 
-    def active_bias(self) -> Optional[torch.Tensor]:
+    def active_bias(self) -> torch.Tensor | None:
         return None if self.bias is None else self.bias[: self.active_out]
 
 
@@ -158,8 +159,8 @@ class DynamicBatchNorm(DynamicModule, nn.modules.batchnorm._BatchNorm):
         if input.dim() < 2:
             raise ValueError(f"expected at least 2D input (got {input.dim()}D input)")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self._check_input_dim(x)
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        self._check_input_dim(input)
         weight = None if self.weight is None else self._select_in(self.weight, 0)
         bias = None if self.bias is None else self._select_in(self.bias, 0)
 
@@ -167,23 +168,24 @@ class DynamicBatchNorm(DynamicModule, nn.modules.batchnorm._BatchNorm):
         update = self.training and self.track_running_stats and self.update_stats
 
         momentum = 0.0 if self.momentum is None else self.momentum
-        if update:
+        if update and self.num_batches_tracked is not None:
             self.num_batches_tracked.add_(1)
             if self.momentum is None:
                 momentum = 1.0 / float(self.num_batches_tracked)
 
         if use_batch_stats and not update:
-            return F.batch_norm(x, None, None, weight, bias, True, 0.0, self.eps)
+            return F.batch_norm(input, None, None, weight, bias, True, 0.0, self.eps)
 
+        assert self.running_mean is not None and self.running_var is not None
         prefix = _is_prefix(self.in_segments)
         mean = self._select_in(self.running_mean, 0)
         var = self._select_in(self.running_var, 0)
         if update and not prefix:
             # index_select returns a copy: update it, then write it back.
             mean, var = mean.clone(), var.clone()
-        out = F.batch_norm(x, mean, var, weight, bias, use_batch_stats, momentum, self.eps)
+        out = F.batch_norm(input, mean, var, weight, bias, use_batch_stats, momentum, self.eps)
         if update and not prefix:
-            idx = self._index(x.device)
+            idx = self._index(input.device)
             self.running_mean.index_copy_(0, idx, mean)
             self.running_var.index_copy_(0, idx, var)
         return out

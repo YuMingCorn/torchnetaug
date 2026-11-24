@@ -15,13 +15,14 @@ Checked for a residual CNN (TinyResNet, torchvision ResNet-18, MobileNetV2) and 
 from __future__ import annotations
 
 import random
+from typing import Any
 
 import pytest
 import torch
-import torch.nn as nn
 import torchvision
 from conftest import assert_sorted, randomize
 from test_widths import BASE_WIDTHS, TinyResNet
+from torch import nn
 
 from torchnetaug import DepthStack, DynamicConv2d, DynamicLinear, NetAugModel, netaug_step, recalibrate_bn
 
@@ -47,11 +48,12 @@ class PlainStack(nn.Module):
 
 
 CASES = {
-    "tiny_resnet": (lambda: TinyResNet(BASE_WIDTHS),
-                    {"layers.1": 1, "layers.3": 1, "layers.5": 2, "layers.7": 1}),
+    "tiny_resnet": (lambda: TinyResNet(BASE_WIDTHS), {"layers.1": 1, "layers.3": 1, "layers.5": 2, "layers.7": 1}),
     "resnet18": (lambda: torchvision.models.resnet18(num_classes=10), {"layer1": 1, "layer3": 2}),
-    "mobilenet_v2": (lambda: torchvision.models.mobilenet_v2(width_mult=0.35, num_classes=10),
-                     {"features.3": 1, "features.6": 2}),
+    "mobilenet_v2": (
+        lambda: torchvision.models.mobilenet_v2(width_mult=0.35, num_classes=10),
+        {"features.3": 1, "features.6": 2},
+    ),
     "plain_stack": (PlainStack, {"body": 2}),
 }
 RESIDUAL = {"tiny_resnet", "resnet18", "mobilenet_v2"}
@@ -122,19 +124,22 @@ def test_sequential_subclass_is_one_block():
     net = nn.Sequential(nn.Conv2d(3, 8, 3, padding=1), Block(8), nn.Flatten(), nn.LazyLinear(5))
     net(_x())  # materialize the lazy layer
     netaug = NetAugModel(net, _x(), depth={"1": 1})
-    assert isinstance(netaug.model[1], DepthStack) and netaug.max_depths == {"1": 1}
+    seq: Any = netaug.model
+    assert isinstance(seq[1], DepthStack) and netaug.max_depths == {"1": 1}
 
 
 def test_plain_extra_blocks_are_not_zeroed():
     torch.manual_seed(0)
     netaug = NetAugModel(PlainStack(), _x(), depth={"body": 1})
-    extra = netaug.model.body[1].extra[0]
-    assert isinstance(netaug.model.body[1], DepthStack)
+    body: Any = netaug.model.body
+    extra = body[1].extra[0]
+    assert isinstance(body[1], DepthStack)
     assert extra[1].weight.abs().min() > 0  # zeroing would cut the signal of a plain block
 
 
 def test_zero_example_input_does_not_zero_plain_extra_block():
     """Tracing with torch.zeros must not mistake a bias-free plain block for a residual block."""
+
     class BiasFreePlain(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -147,11 +152,12 @@ def test_zero_example_input_does_not_zero_plain_extra_block():
 
     zeros = torch.zeros(1, 3, 16, 16)
     plain = NetAugModel(BiasFreePlain().eval(), zeros, width_mults=(1.0, 2.0), depth={"body": 1}).eval()
-    extra_bn = plain.model.body[1].extra[0][1]
+    plain_model: Any = plain.model
+    extra_bn = plain_model.body[1].extra[0][1]
     assert extra_bn.weight.abs().min() > 0
     plain.set_depths({"body.1": 1})
     with torch.no_grad():
-        assert plain.model.body(plain.model.stem(_x())).abs().max() > 0
+        assert plain_model.body(plain_model.stem(_x())).abs().max() > 0
 
     # Residual blocks traced with zeros still start as identity at both base and max widths.
     res_base = TinyResNet(BASE_WIDTHS).eval()
@@ -255,8 +261,11 @@ def test_netaug_step_trains_extra_blocks_and_keeps_base_bn():
     _, netaug = _make("tiny_resnet")
     netaug.train()
     extra = netaug.model.get_submodule("layers.7").extra[0]
-    seed = next(s for s in range(100)  # a seed whose sample runs the layers.7 extra block
-                if (netaug.set_random(random.Random(s)), netaug.active_depths["layers.7"])[1] == 1)
+    seed = next(
+        s
+        for s in range(100)  # a seed whose sample runs the layers.7 extra block
+        if (netaug.set_random(random.Random(s)), netaug.active_depths["layers.7"])[1] == 1
+    )
     netaug.set_base()
     extra_bn = extra.bn1
     stats = extra_bn.running_mean.clone()
@@ -324,9 +333,16 @@ def test_depth_needs_tracing():
 def test_bare_layer_as_depth_point_exports():
     """A depth point may be a single layer (not a block): export at width and depth works."""
     torch.manual_seed(0)
-    model = randomize(nn.Sequential(
-        nn.Conv2d(3, 8, 3, padding=1), nn.Conv2d(8, 8, 3, padding=1), nn.ReLU(),
-        nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(8, 4))).eval()
+    model = randomize(
+        nn.Sequential(
+            nn.Conv2d(3, 8, 3, padding=1),
+            nn.Conv2d(8, 8, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(8, 4),
+        )
+    ).eval()
     netaug = NetAugModel(model, _x(), depth={"1": 1}).eval()
     x = _x()
     for state in ("base", "max"):
@@ -440,13 +456,14 @@ def test_export_converts_every_alias_of_a_non_persistent_buffer():
         torch.set_default_dtype(previous)
     assert model.s.t1 is model.s.f.t2
     netaug = NetAugModel(model, x).double().eval()
-    exported = netaug.export().eval()
+    exported: Any = netaug.export().eval()
     assert exported.s.t1.dtype == exported.s.f.t2.dtype == torch.float64
     with torch.no_grad():
         torch.testing.assert_close(exported(x.double()), netaug(x.double()), rtol=0, atol=0)
     # .double() untied the model's aliases; if they diverge, each keeps its own value
     with torch.no_grad():
-        netaug.model.s.f.t2.add_(5.0)
+        s_mod: Any = netaug.model.s
+        s_mod.f.t2.add_(5.0)
         exported = netaug.export().eval()
         torch.testing.assert_close(exported(x.double()), netaug(x.double()), rtol=0, atol=0)
 
@@ -486,9 +503,9 @@ def _to_model_name(name: str, depths: dict) -> str:
     for p, d in depths.items():
         if d == 0:
             if name == p or name.startswith(p + "."):
-                return p + ".block" + name[len(p):]
+                return p + ".block" + name[len(p) :]
         elif name.startswith(p + "."):
-            idx_str, _, rest = name[len(p) + 1:].partition(".")
+            idx_str, _, rest = name[len(p) + 1 :].partition(".")
             idx = int(idx_str)
             sub = "block" if idx == 0 else f"extra.{idx - 1}"
             return f"{p}.{sub}" + (f".{rest}" if rest else "")
@@ -511,7 +528,8 @@ def test_netaug_step_gradient_is_paper_eq2_with_depth(case):
 
     # Pick a seed that activates both widening and at least one extra block.
     seed = next(
-        s for s in range(200)
+        s
+        for s in range(200)
         if (
             netaug.set_random(random.Random(s)),
             netaug.active_sizes != netaug.base_sizes and any(d > 0 for d in netaug.active_depths.values()),

@@ -21,9 +21,9 @@ import random
 import sys
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from cifar_netaug import TinyResNet
+from torch import nn
 
 from torchnetaug import NetAugModel, netaug_step, recalibrate_bn
 
@@ -61,7 +61,13 @@ def accuracy(model: nn.Module, x: torch.Tensor, y: torch.Tensor) -> float:
     return (model(x).argmax(1) == y).float().mean().item()
 
 
-def compare_widths(netaug: NetAugModel, x_check: torch.Tensor, calib, x_test=None, y_test=None) -> None:
+def compare_widths(
+    netaug: NetAugModel,
+    x_check: torch.Tensor,
+    calib,
+    x_test: torch.Tensor | None = None,
+    y_test: torch.Tensor | None = None,
+) -> None:
     print("  width | params (dynamic) | params (plain model) | max |out diff| | test acc")
     for m in MULTS:
         sub = copy.deepcopy(netaug)
@@ -75,7 +81,7 @@ def compare_widths(netaug: NetAugModel, x_check: torch.Tensor, calib, x_test=Non
             out, out_ref = sub(x_check), ref(x_check)
         diff = (out - out_ref).abs().max().item()
         scale = out_ref.abs().max().item()
-        acc = "" if x_test is None else f"{accuracy(sub, x_test, y_test) * 100:6.2f}%"
+        acc = "" if x_test is None or y_test is None else f"{accuracy(sub, x_test, y_test) * 100:6.2f}%"
         print(f"  x{m:<4} | {n_dyn:16,} | {n_ref:20,} | {diff:.2e} (|logit| max {scale:.1f}) | {acc}")
         check(n_dyn == n_ref, f"x{m}: parameter count equals the plain model")
         check(diff <= 1e-4 * max(1.0, scale), f"x{m}: output equals the plain model")
@@ -105,6 +111,7 @@ def main() -> None:
         netaug.train()
         idx = torch.randint(0, x_tr.shape[0], (bs,), device=device)
         base_loss, aug_loss = netaug_step(netaug, x_tr[idx], y_tr[idx], F.cross_entropy, generator=rng)
+        assert aug_loss is not None
         opt.step()
         opt.zero_grad(set_to_none=True)
         if step == 1:
@@ -119,12 +126,15 @@ def main() -> None:
                     netaug.sort_channels(optimizer=opt)
                     after = netaug(x_te[:64])
                 d = (before - after).abs().max().item()
-                check(d <= 1e-4 * max(1.0, before.abs().max().item()),
-                      f"step {step}: sorting keeps the max-width output (max diff {d:.1e})")
+                check(
+                    d <= 1e-4 * max(1.0, before.abs().max().item()),
+                    f"step {step}: sorting keeps the max-width output (max diff {d:.1e})",
+                )
+    assert first is not None and last is not None
     check(last[0] < first[0] and last[1] < first[1], "base and augmented losses go down")
 
     print("\n3) after training: each width, BN recalibrated, against a plain model of that width")
-    calib = [x_tr[k:k + 128] for k in range(0, 1024, 128)]
+    calib = [x_tr[k : k + 128] for k in range(0, 1024, 128)]
     compare_widths(netaug, x_te[:64], calib=calib, x_test=x_te, y_test=y_te)
 
     netaug.set_base()

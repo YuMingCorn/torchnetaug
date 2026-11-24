@@ -27,9 +27,9 @@ import time
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+from torch import nn
 
 from torchnetaug import DynamicConv2d, DynamicLinear, NetAugModel, netaug_step, recalibrate_bn
 
@@ -57,8 +57,9 @@ def augment(x: torch.Tensor, gen: torch.Generator) -> torch.Tensor:
     j = torch.randint(0, 9, (n,), device=x.device, generator=gen)
     rows = (i.view(n, 1) + torch.arange(32, device=x.device)).view(n, 1, 32, 1).expand(n, 3, 32, 32)
     cols = (j.view(n, 1) + torch.arange(32, device=x.device)).view(n, 1, 1, 32).expand(n, 3, 32, 32)
-    out = padded[torch.arange(n, device=x.device).view(n, 1, 1, 1),
-                 torch.arange(3, device=x.device).view(1, 3, 1, 1), rows, cols]
+    out = padded[
+        torch.arange(n, device=x.device).view(n, 1, 1, 1), torch.arange(3, device=x.device).view(1, 3, 1, 1), rows, cols
+    ]
     flip = torch.rand(n, device=x.device, generator=gen) < 0.5
     out[flip] = out[flip].flip(3)
     return out
@@ -109,15 +110,30 @@ def evaluate(model: nn.Module, x: torch.Tensor, y: torch.Tensor, bs: int = 1000)
     model.eval()
     correct = 0
     for k in range(0, x.shape[0], bs):
-        correct += (model(x[k:k + bs]).argmax(1) == y[k:k + bs]).sum().item()
+        correct += (model(x[k : k + bs]).argmax(1) == y[k : k + bs]).sum().item()
     return correct / x.shape[0]
 
 
 def run_key(r: dict) -> tuple:
-    return (r["dataset"], r["model"], r["epochs"], r["method"], r["sort_every"], r["seed"],
-            tuple(r["width_mults"]), r["alpha"], r["stop_aug"], r.get("width", 1.0), r.get("depth", 0),
-            r.get("lr", 0.1), r.get("wd", 5e-4), r.get("amp", "bf16"),
-            r.get("init", "base"), r.get("granularity", "group"), r.get("warmup", 0))
+    return (
+        r["dataset"],
+        r["model"],
+        r["epochs"],
+        r["method"],
+        r["sort_every"],
+        r["seed"],
+        tuple(r["width_mults"]),
+        r["alpha"],
+        r["stop_aug"],
+        r.get("width", 1.0),
+        r.get("depth", 0),
+        r.get("lr", 0.1),
+        r.get("wd", 5e-4),
+        r.get("amp", "bf16"),
+        r.get("init", "base"),
+        r.get("granularity", "group"),
+        r.get("warmup", 0),
+    )
 
 
 def base_masks(model: NetAugModel) -> dict:
@@ -138,10 +154,11 @@ def base_masks(model: NetAugModel) -> dict:
                     sliced = layer.active_weight() if attr == "weight" else layer.active_bias()
                 else:  # batch norm: input channels only
                     sliced = layer._select_in(p, 0)
+                assert sliced is not None
                 (g,) = torch.autograd.grad(sliced.sum(), p)
                 masks[id(p)] = g != 0
     for path in model._depth_paths:
-        for p in model.model.get_submodule(path).extra.parameters():
+        for p in model._stack(path).extra.parameters():
             masks[id(p)] = torch.zeros_like(p, dtype=torch.bool)
     return masks
 
@@ -188,8 +205,11 @@ class GradProbe:
         self.snaps = []
 
     def epoch_summary(self) -> dict:
-        out = {"cos": sum(self.cos) / len(self.cos), "ratio": sum(self.ratio) / len(self.ratio),
-               "n": len(self.cos)} if self.cos else {}
+        out = (
+            {"cos": sum(self.cos) / len(self.cos), "ratio": sum(self.ratio) / len(self.ratio), "n": len(self.cos)}
+            if self.cos
+            else {}
+        )
         self.cos, self.ratio = [], []
         return out
 
@@ -203,47 +223,95 @@ def main() -> None:
     p.add_argument("--bs", type=int, default=128)
     p.add_argument("--lr", type=float, default=0.1)
     p.add_argument("--wd", type=float, default=5e-4)
-    p.add_argument("--warmup", type=int, default=0,
-                   help="epochs of linear learning-rate warmup before the cosine decay")
-    p.add_argument("--amp", default="bf16", choices=["bf16", "fp16", "off"],
-                   help="mixed precision of the training forward pass (fp16 uses a gradient scaler)")
+    p.add_argument(
+        "--warmup", type=int, default=0, help="epochs of linear learning-rate warmup before the cosine decay"
+    )
+    p.add_argument(
+        "--amp",
+        default="bf16",
+        choices=["bf16", "fp16", "off"],
+        help="mixed precision of the training forward pass (fp16 uses a gradient scaler)",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--width-mults", type=float, nargs="+", default=[1.0, 2.0, 3.0])
     p.add_argument("--alpha", type=float, default=1.0)
-    p.add_argument("--stop-aug", type=float, default=0.0,
-                   help="fraction of final epochs trained without augmentation")
+    p.add_argument("--stop-aug", type=float, default=0.0, help="fraction of final epochs trained without augmentation")
     p.add_argument("--sort-every", type=int, default=0, help="sort channels every N epochs (0 = never)")
-    p.add_argument("--eval-widths", type=float, nargs="+", default=[1.0, 1.5, 2.0, 2.5, 3.0],
-                   help="NetAug only: also report accuracy at these global width multipliers")
-    p.add_argument("--eval-random", type=int, default=3,
-                   help="NetAug only: also report accuracy of this many per-group random widths")
-    p.add_argument("--width", type=float, default=1.0,
-                   help="TinyResNet only: width of the base model relative to (8, 16, 32, 64). For the "
-                        "baseline this is the model trained alone; for NetAug it is the base model")
-    p.add_argument("--init", default="base", choices=["base", "max"],
-                   help="NetAug only. base: the base weights keep the initialization of the plain model "
-                        "(same as the baseline of the same seed) and the added channels get the default "
-                        "initialization. max: the default initialization is applied again to the whole "
-                        "max-width network, as the official code does; the base weights then differ "
-                        "from the baseline of the same seed")
-    p.add_argument("--granularity", default="group", choices=["group", "global"],
-                   help="NetAug only: sample a width for each channel group, or one multiplier for the whole model")
-    p.add_argument("--depth", type=int, default=0,
-                   help="depth augmentation: extra blocks after each TinyResNet stage (netaug only)")
-    p.add_argument("--grad-log-every", type=int, default=0,
-                   help="NetAug only: every N steps, compare the base and augmented gradients "
-                        "on the base weights (cosine, norm ratio); 0 = never")
+    p.add_argument(
+        "--eval-widths",
+        type=float,
+        nargs="+",
+        default=[1.0, 1.5, 2.0, 2.5, 3.0],
+        help="NetAug only: also report accuracy at these global width multipliers",
+    )
+    p.add_argument(
+        "--eval-random",
+        type=int,
+        default=3,
+        help="NetAug only: also report accuracy of this many per-group random widths",
+    )
+    p.add_argument(
+        "--width",
+        type=float,
+        default=1.0,
+        help="TinyResNet only: width of the base model relative to (8, 16, 32, 64). For the "
+        "baseline this is the model trained alone; for NetAug it is the base model",
+    )
+    p.add_argument(
+        "--init",
+        default="base",
+        choices=["base", "max"],
+        help="NetAug only. base: the base weights keep the initialization of the plain model "
+        "(same as the baseline of the same seed) and the added channels get the default "
+        "initialization. max: the default initialization is applied again to the whole "
+        "max-width network, as the official code does; the base weights then differ "
+        "from the baseline of the same seed",
+    )
+    p.add_argument(
+        "--granularity",
+        default="group",
+        choices=["group", "global"],
+        help="NetAug only: sample a width for each channel group, or one multiplier for the whole model",
+    )
+    p.add_argument(
+        "--depth",
+        type=int,
+        default=0,
+        help="depth augmentation: extra blocks after each TinyResNet stage (netaug only)",
+    )
+    p.add_argument(
+        "--grad-log-every",
+        type=int,
+        default=0,
+        help="NetAug only: every N steps, compare the base and augmented gradients "
+        "on the base weights (cosine, norm ratio); 0 = never",
+    )
     p.add_argument("--data", default="data")
     p.add_argument("--out", default="runs/cifar_results.jsonl")
     p.add_argument("--skip-existing", action="store_true", help="skip if --out already has this run")
     args = p.parse_args()
 
-    key = run_key({"dataset": args.dataset, "model": args.model, "epochs": args.epochs,
-                   "method": args.method, "sort_every": args.sort_every if args.method == "netaug" else 0,
-                   "seed": args.seed, "width_mults": args.width_mults, "alpha": args.alpha,
-                   "stop_aug": args.stop_aug, "width": args.width, "depth": args.depth,
-                   "lr": args.lr, "wd": args.wd, "amp": args.amp,
-                   "init": args.init, "granularity": args.granularity, "warmup": args.warmup})
+    key = run_key(
+        {
+            "dataset": args.dataset,
+            "model": args.model,
+            "epochs": args.epochs,
+            "method": args.method,
+            "sort_every": args.sort_every if args.method == "netaug" else 0,
+            "seed": args.seed,
+            "width_mults": args.width_mults,
+            "alpha": args.alpha,
+            "stop_aug": args.stop_aug,
+            "width": args.width,
+            "depth": args.depth,
+            "lr": args.lr,
+            "wd": args.wd,
+            "amp": args.amp,
+            "init": args.init,
+            "granularity": args.granularity,
+            "warmup": args.warmup,
+        }
+    )
     if args.depth and (args.method != "netaug" or args.model != "resnet_tiny"):
         p.error("--depth is only for --method netaug --model resnet_tiny")
     if args.width != 1.0 and args.model != "resnet_tiny":
@@ -269,23 +337,27 @@ def main() -> None:
     if args.method == "netaug":
         # depth: the second block of each stage (layers.1, .3, .5, .7) gets extra copies
         depth = {f"layers.{2 * s + 1}": args.depth for s in range(4)} if args.depth else None
-        model: nn.Module = NetAugModel(base, xtr[:2], width_mults=args.width_mults, depth=depth)
+        netaug_model = NetAugModel(base, xtr[:2], width_mults=args.width_mults, depth=depth)
         if args.init == "max":
             # Initialize the largest network as a whole (the official code does this). The
             # default initializer scales with the fan-in, which is now the max-width fan-in
             # for the base channels too. BN weights stay 1 / 0 (0 in residual extra blocks).
-            for _, layer in model.dynamic_layers():
+            for _, layer in netaug_model.dynamic_layers():
                 if isinstance(layer, (DynamicConv2d, DynamicLinear)):
                     layer.reset_parameters()
-        print(model.graph.summary())
+        print(netaug_model.graph.summary())
+        model: nn.Module = netaug_model
     else:
         model = base
 
     decay = [p for p in model.parameters() if p.ndim > 1]
     no_decay = [p for p in model.parameters() if p.ndim <= 1]
-    opt = torch.optim.SGD([{"params": decay, "weight_decay": args.wd},
-                           {"params": no_decay, "weight_decay": 0.0}],
-                          lr=args.lr, momentum=0.9, nesterov=True)
+    opt = torch.optim.SGD(
+        [{"params": decay, "weight_decay": args.wd}, {"params": no_decay, "weight_decay": 0.0}],
+        lr=args.lr,
+        momentum=0.9,
+        nesterov=True,
+    )
     steps_per_epoch = xtr.shape[0] // args.bs
     total = steps_per_epoch * args.epochs
     warm = steps_per_epoch * args.warmup
@@ -296,7 +368,7 @@ def main() -> None:
         return 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, total - warm)))
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
-    aug_until = int(round(args.epochs * (1 - args.stop_aug)))
+    aug_until = round(args.epochs * (1 - args.stop_aug))
 
     def crit(out, y):  # float32 loss even though the forward pass runs in bf16
         return F.cross_entropy(out.float(), y)
@@ -317,6 +389,7 @@ def main() -> None:
     def sort_and_log(epoch: int) -> None:
         """Sort channels and record evidence that the sort (a) moved channels across the
         base boundary and (b) kept the max-width function on the real trained weights."""
+        assert isinstance(model, NetAugModel)
         probe = xte[:500]
         tf32 = (torch.backends.cudnn.allow_tf32, torch.backends.cuda.matmul.allow_tf32)
         torch.backends.cudnn.allow_tf32 = False
@@ -330,33 +403,45 @@ def main() -> None:
         model.train()
         torch.backends.cudnn.allow_tf32, torch.backends.cuda.matmul.allow_tf32 = tf32
         moved = sum(int((perm[: model.base_sizes[g]] >= model.base_sizes[g]).sum()) for g, perm in perms.items())
-        entry = {"epoch": epoch, "groups": len(perms),
-                 "base_channels": sum(model.base_sizes[g] for g in perms),
-                 "moved_into_base": moved,
-                 "max_abs_diff": (after - before).abs().max().item(),
-                 "max_abs_logit": before.abs().max().item()}
+        entry = {
+            "epoch": epoch,
+            "groups": len(perms),
+            "base_channels": sum(model.base_sizes[g] for g in perms),
+            "moved_into_base": moved,
+            "max_abs_diff": (after - before).abs().max().item(),
+            "max_abs_logit": before.abs().max().item(),
+        }
         sort_log.append(entry)
         print("sort:", entry, flush=True)
 
-    probe = GradProbe(model, args.alpha, backward) if args.method == "netaug" and args.grad_log_every else None
+    probe = GradProbe(model, args.alpha, backward) if isinstance(model, NetAugModel) and args.grad_log_every else None
     grad_log = []
 
     epoch_loss = []
     t0 = time.time()
     for epoch in range(args.epochs):
         model.train()
-        if args.method == "netaug" and args.sort_every and epoch and epoch % args.sort_every == 0:
+        if isinstance(model, NetAugModel) and args.sort_every and epoch and epoch % args.sort_every == 0:
             sort_and_log(epoch)
         perm = torch.randperm(xtr.shape[0], device=device, generator=gen)
         loss_sum = torch.zeros((), device=device)
         for s in range(steps_per_epoch):
-            idx = perm[s * args.bs:(s + 1) * args.bs]
+            idx = perm[s * args.bs : (s + 1) * args.bs]
             xb, yb = augment(xtr[idx], gen), ytr[idx]
-            if args.method == "netaug":
+            if isinstance(model, NetAugModel):
                 logged = probe is not None and s % args.grad_log_every == 0
-                loss, _ = netaug_step(model, xb, yb, crit, alpha=args.alpha, augment=epoch < aug_until,
-                                      generator=rng, granularity=args.granularity, forward=fwd,
-                                      backward=probe.backward if logged else backward)
+                loss, _ = netaug_step(
+                    model,
+                    xb,
+                    yb,
+                    crit,
+                    alpha=args.alpha,
+                    augment=epoch < aug_until,
+                    generator=rng,
+                    granularity=args.granularity,
+                    forward=fwd,
+                    backward=probe.backward if logged else backward,
+                )
                 if logged:
                     probe.finish_step()
             else:
@@ -375,16 +460,19 @@ def main() -> None:
             g = ""
             if grad_log and "cos" in grad_log[-1]:
                 g = f"  grad cos {grad_log[-1]['cos']:.3f} ratio {grad_log[-1]['ratio']:.2f}"
-            print(f"epoch {epoch + 1}/{args.epochs}  base loss {epoch_loss[-1]:.3f}  "
-                  f"{time.time() - t0:.0f}s{g}", flush=True)
+            print(
+                f"epoch {epoch + 1}/{args.epochs}  base loss {epoch_loss[-1]:.3f}  {time.time() - t0:.0f}s{g}",
+                flush=True,
+            )
     train_minutes = (time.time() - t0) / 60
 
     # Every evaluated model gets the same BN calibration: exact averages over 20 clean
     # training batches, in float32.
-    calib = [xtr[k:k + 500] for k in range(0, 10000, 500)]
+    calib = [xtr[k : k + 500] for k in range(0, 10000, 500)]
 
     def eval_at(sizes, depths=None) -> dict:
         # All widths share the BN buffers, so calibrate each width on its own copy.
+        assert isinstance(model, NetAugModel)
         depths = dict(depths or model.base_depths)
         sub = copy.deepcopy(model)
         sub.set_state((sizes, depths, "custom"))
@@ -394,15 +482,19 @@ def main() -> None:
         sub.eval(), exported.eval()
         with torch.no_grad():
             diff = (sub(xte[:1000]) - exported(xte[:1000])).abs().max().item()
-        out = {"params": sub.num_active_params(), "test_acc": evaluate(sub, xte, yte),
-               "train_acc": evaluate(sub, xtr[:10000], ytr[:10000]),
-               "export_params": sum(q.numel() for q in exported.parameters()),
-               "export_test_acc": evaluate(exported, xte, yte), "export_max_abs_diff": diff}
+        out = {
+            "params": sub.num_active_params(),
+            "test_acc": evaluate(sub, xte, yte),
+            "train_acc": evaluate(sub, xtr[:10000], ytr[:10000]),
+            "export_params": sum(q.numel() for q in exported.parameters()),
+            "export_test_acc": evaluate(exported, xte, yte),
+            "export_max_abs_diff": diff,
+        }
         del sub, exported
         return out
 
     width_acc, random_acc = {}, []
-    if args.method == "netaug":
+    if isinstance(model, NetAugModel):
         # Global widths: every free group scaled by the same factor. x1.5 and x2.5 are
         # never sampled in training (each group samples from x1, x2, x3).
         for m in args.eval_widths:
@@ -418,18 +510,37 @@ def main() -> None:
         model.set_base()
 
     recalibrate_bn(model, calib)
-    final = model.export() if args.method == "netaug" else model
+    final = model.export() if isinstance(model, NetAugModel) else model
     test_acc = evaluate(final, xte, yte)
     train_acc = evaluate(final, xtr[:10000], ytr[:10000])
-    rec = {"method": args.method, "model": args.model, "dataset": args.dataset, "seed": args.seed,
-           "epochs": args.epochs, "width_mults": args.width_mults, "alpha": args.alpha,
-           "stop_aug": args.stop_aug, "sort_every": key[4], "width": args.width, "depth": args.depth,
-           "lr": args.lr, "wd": args.wd, "amp": args.amp, "init": args.init, "warmup": args.warmup,
-           "granularity": args.granularity, "params": n_base,
-           "test_acc": test_acc, "train_acc": train_acc, "width_acc": width_acc,
-           "random_acc": random_acc, "sort_log": sort_log, "epoch_loss": epoch_loss,
-           "grad_log": grad_log,
-           "minutes": train_minutes}
+    rec = {
+        "method": args.method,
+        "model": args.model,
+        "dataset": args.dataset,
+        "seed": args.seed,
+        "epochs": args.epochs,
+        "width_mults": args.width_mults,
+        "alpha": args.alpha,
+        "stop_aug": args.stop_aug,
+        "sort_every": key[4],
+        "width": args.width,
+        "depth": args.depth,
+        "lr": args.lr,
+        "wd": args.wd,
+        "amp": args.amp,
+        "init": args.init,
+        "warmup": args.warmup,
+        "granularity": args.granularity,
+        "params": n_base,
+        "test_acc": test_acc,
+        "train_acc": train_acc,
+        "width_acc": width_acc,
+        "random_acc": random_acc,
+        "sort_log": sort_log,
+        "epoch_loss": epoch_loss,
+        "grad_log": grad_log,
+        "minutes": train_minutes,
+    }
     print(json.dumps(rec))
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "a", encoding="utf-8") as f:

@@ -4,7 +4,7 @@
 
 A pure-PyTorch implementation of [Network Augmentation (NetAug)](https://arxiv.org/abs/2110.08890) (Cai et al., ICLR 2022).
 
-> **Project finished (2026-11-23).** The implementation matches the paper, but NetAug gave no significant gain in the CIFAR experiments of this project. See [summary.en.md](summary.en.md).
+> **Project finished (2026-11-24).** The implementation matches the paper, but NetAug gave no significant gain in the CIFAR experiments of this project. See [summary.en.md](summary.en.md).
 
 ## Key points
 

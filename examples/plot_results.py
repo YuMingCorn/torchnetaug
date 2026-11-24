@@ -18,6 +18,7 @@ A figure is skipped when the files hold no data for it.
 """
 
 import argparse
+import math
 import statistics
 import sys
 from collections import defaultdict
@@ -26,11 +27,11 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.ticker import NullFormatter, NullLocator  # noqa: E402
+import matplotlib.pyplot as plt
+from matplotlib.ticker import NullFormatter, NullLocator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from summarize import is_width, load, mean_ci, paired  # noqa: E402
+from summarize import is_width, load, mean_ci, paired
 
 # Colors (validated for color-vision deficiency as a set of three): one per role.
 ALONE, NETAUG = "#2a78d6", "#eb6834"
@@ -38,14 +39,30 @@ ORDINAL = ["#86b6ef", "#2a78d6", "#104281"]  # light to dark blue, for ordered s
 INK, INK2, MUTED, GRID, SURFACE = "#0b0b0b", "#52514e", "#8a8984", "#e6e5e0", "#fcfcfb"
 THRESHOLD = 0.5  # percentage points: the smallest test gain we call material
 
-plt.rcParams.update({
-    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
-    "axes.edgecolor": MUTED, "axes.labelcolor": INK2, "text.color": INK,
-    "xtick.color": INK2, "ytick.color": INK2, "axes.spines.top": False, "axes.spines.right": False,
-    "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.8, "axes.axisbelow": True,
-    "lines.linewidth": 2, "lines.markersize": 6, "font.size": 9, "axes.titlesize": 10,
-    "legend.frameon": False, "errorbar.capsize": 0,
-})
+plt.rcParams.update(
+    {
+        "figure.facecolor": SURFACE,
+        "axes.facecolor": SURFACE,
+        "savefig.facecolor": SURFACE,
+        "axes.edgecolor": MUTED,
+        "axes.labelcolor": INK2,
+        "text.color": INK,
+        "xtick.color": INK2,
+        "ytick.color": INK2,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": True,
+        "grid.color": GRID,
+        "grid.linewidth": 0.8,
+        "axes.axisbelow": True,
+        "lines.linewidth": 2,
+        "lines.markersize": 6,
+        "font.size": 9,
+        "axes.titlesize": 10,
+        "legend.frameon": False,
+        "errorbar.capsize": 0,
+    }
+)
 
 
 def acc(rs, key="test_acc"):
@@ -64,18 +81,17 @@ def exported(rs, w):
 
 def bar(ax, x, m, h, color, **kw):
     """A point with a 95% confidence bar (no bar for a single seed)."""
-    ax.errorbar(x, m, yerr=None if h != h else h, color=color, fmt="o", elinewidth=1.5, **kw)
+    ax.errorbar(x, m, yerr=None if math.isnan(h) else h, color=color, fmt="o", elinewidth=1.5, **kw)
 
 
 def label_end(ax, x, y, text, color=INK2):
-    ax.annotate(text, (x, y), xytext=(6, 0), textcoords="offset points", va="center",
-                fontsize=8, color=color)
+    ax.annotate(text, (x, y), xytext=(6, 0), textcoords="offset points", va="center", fontsize=8, color=color)
 
 
 def log_ticks(ax, values):
     """Ticks at 1, 2 and 5 times powers of ten inside the data range, labelled 20k, 1M, ..."""
     lo, hi = min(values) / 1.15, max(values) * 1.15
-    ticks = [m * 10 ** k for k in range(2, 9) for m in (1, 2, 5) if lo <= m * 10 ** k <= hi]
+    ticks = [m * 10**k for k in range(2, 9) for m in (1, 2, 5) if lo <= m * 10**k <= hi]
     ax.set_xlim(lo, hi)
     ax.set_xticks(ticks, [f"{t / 1e6:g}M" if t >= 1e6 else f"{t / 1e3:g}k" for t in ticks])
     ax.xaxis.set_minor_locator(NullLocator())
@@ -99,32 +115,44 @@ def panels(n, w=4.2, h=3.4):
 
 
 def plot_acc_vs_params(groups, out, variant):
-    facets = sorted({(ds, model, ep) for (ds, model, ep, bw, label) in groups if label == variant}
-                    | {(ds, model, ep) for (ds, model, ep, bw, label) in groups
-                       if label == "baseline" and sum(k[:3] == (ds, model, ep) and k[4] == "baseline"
-                                                      for k in groups) > 1})
+    facets = sorted(
+        {(ds, model, ep) for (ds, model, ep, bw, label) in groups if label == variant}
+        | {
+            (ds, model, ep)
+            for (ds, model, ep, bw, label) in groups
+            if label == "baseline" and sum(k[:3] == (ds, model, ep) and k[4] == "baseline" for k in groups) > 1
+        }
+    )
     if not facets:
         return
     fig, axes = panels(len(facets))
     for ax, (ds, model, ep) in zip(axes, facets):
-        alone = sorted((rs[0]["params"], *acc(rs)) for (d, mo, e, bw, l), rs in groups.items()
-                       if (d, mo, e, l) == (ds, model, ep, "baseline"))
+        alone = sorted(
+            (rs[0]["params"], *acc(rs))
+            for (d, mo, e, bw, lbl), rs in groups.items()
+            if (d, mo, e, lbl) == (ds, model, ep, "baseline")
+        )
         if alone:
             ax.plot([p for p, _, _ in alone], [m for _, m, _ in alone], color=ALONE, label="trained alone")
             for p, m, h in alone:
                 bar(ax, p, m, h, ALONE)
-        bases = sorted(bw for (d, mo, e, bw, l) in groups if (d, mo, e, l) == (ds, model, ep, variant))
+        bases = sorted(bw for (d, mo, e, bw, lbl) in groups if (d, mo, e, lbl) == (ds, model, ep, variant))
         base_pts = []
         for i, bw in enumerate(bases):
             rs = groups[(ds, model, ep, bw, variant)]
             m, h = acc(rs)
             base_pts.append((rs[0]["params"], m))
-            widths = sorted({w for r in rs for w in r.get("width_acc", {}) if is_width(w) and float(w) > 1},
-                            key=float)
+            widths = sorted({w for r in rs for w in r.get("width_acc", {}) if is_width(w) and float(w) > 1}, key=float)
             pts = [exported(rs, w) for w in widths]
             if pts:
-                ax.plot([rs[0]["params"]] + [p[0] for p in pts], [m] + [p[1] for p in pts], color=NETAUG,
-                        linestyle="--", linewidth=1.5, label="wider models exported from NetAug" if i == 0 else None)
+                ax.plot(
+                    [rs[0]["params"]] + [p[0] for p in pts],
+                    [m] + [p[1] for p in pts],
+                    color=NETAUG,
+                    linestyle="--",
+                    linewidth=1.5,
+                    label="wider models exported from NetAug" if i == 0 else None,
+                )
                 for p, pm, ph, _ in pts:
                     bar(ax, p, pm, ph, NETAUG, mfc=SURFACE, mew=1.5)
             bar(ax, rs[0]["params"], m, h, NETAUG, zorder=3)
@@ -141,8 +169,11 @@ def plot_acc_vs_params(groups, out, variant):
 
 
 def plot_acc_vs_width_mult(groups, out, variant):
-    facets = sorted(k for k, rs in groups.items()
-                    if k[4] == variant and any(is_width(w) for r in rs for w in r.get("width_acc", {})))
+    facets = sorted(
+        k
+        for k, rs in groups.items()
+        if k[4] == variant and any(is_width(w) for r in rs for w in r.get("width_acc", {}))
+    )
     if not facets:
         return
     fig, axes = panels(len(facets), w=3.6)
@@ -172,7 +203,7 @@ def plot_acc_vs_width_mult(groups, out, variant):
 
 
 def verdict(m, h):
-    if h != h:
+    if math.isnan(h):
         return "one seed"
     if m - h > 0:
         return "gain"
@@ -188,24 +219,40 @@ def plot_paired(groups, out, ref_epochs):
         if pairs:
             test = mean_ci([r["test_acc"] - b["test_acc"] for r, b in pairs])
             train = mean_ci([r["train_acc"] - b["train_acc"] for r, b in pairs])
-            ds, model, ep, bw, label = key
+            ds, _model, ep, bw, label = key
             rows.append((f"{ds} x{bw:g} {ep}ep  {label}  (n={len(pairs)})", test, train))
     if not rows:
         return
-    fig, (ax_t, ax_r) = plt.subplots(1, 2, figsize=(10, max(2.6, 0.42 * len(rows) + 1.4)), sharey=True,
-                                     gridspec_kw={"width_ratios": [1.3, 1]})
+    fig, (ax_t, ax_r) = plt.subplots(
+        1, 2, figsize=(10, max(2.6, 0.42 * len(rows) + 1.4)), sharey=True, gridspec_kw={"width_ratios": [1.3, 1]}
+    )
     ys = list(range(len(rows)))[::-1]
-    for y, (name, (tm, th), (rm, rh)) in zip(ys, rows):
-        ax_t.errorbar(tm, y, xerr=None if th != th else th, fmt="o", color=NETAUG, elinewidth=1.5)
-        ax_r.errorbar(rm, y, xerr=None if rh != rh else rh, fmt="o", color=NETAUG, elinewidth=1.5)
-        ax_t.annotate(verdict(tm, th), (1.0, y), xycoords=("axes fraction", "data"), xytext=(6, 0),
-                      textcoords="offset points", va="center", fontsize=8, color=INK2)
+    for y, (_name, (tm, th), (rm, rh)) in zip(ys, rows):
+        ax_t.errorbar(tm, y, xerr=None if math.isnan(th) else th, fmt="o", color=NETAUG, elinewidth=1.5)
+        ax_r.errorbar(rm, y, xerr=None if math.isnan(rh) else rh, fmt="o", color=NETAUG, elinewidth=1.5)
+        ax_t.annotate(
+            verdict(tm, th),
+            (1.0, y),
+            xycoords=("axes fraction", "data"),
+            xytext=(6, 0),
+            textcoords="offset points",
+            va="center",
+            fontsize=8,
+            color=INK2,
+        )
     for ax in (ax_t, ax_r):
         ax.axvline(0, color=MUTED, linewidth=1)
         ax.grid(axis="y", visible=False)
     ax_t.axvline(THRESHOLD, color=MUTED, linewidth=1, linestyle="--")
-    ax_t.annotate(f"+{THRESHOLD:g}: material gain", (THRESHOLD, 1.0), xycoords=("data", "axes fraction"),
-                  xytext=(3, 2), textcoords="offset points", fontsize=8, color=INK2)
+    ax_t.annotate(
+        f"+{THRESHOLD:g}: material gain",
+        (THRESHOLD, 1.0),
+        xycoords=("data", "axes fraction"),
+        xytext=(3, 2),
+        textcoords="offset points",
+        fontsize=8,
+        color=INK2,
+    )
     ax_t.set_yticks(ys, [r[0] for r in rows])
     ax_t.set_xlabel("test accuracy difference (points)")
     ax_r.set_xlabel("train accuracy difference (points)")
@@ -216,8 +263,7 @@ def plot_paired(groups, out, ref_epochs):
 
 
 def plot_gradient(groups, out):
-    series = [(k, rs) for k, rs in sorted(groups.items())
-              if any("cos" in g for r in rs for g in r.get("grad_log", []))]
+    series = [(k, rs) for k, rs in sorted(groups.items()) if any("cos" in g for r in rs for g in r.get("grad_log", []))]
     if not series:
         return
     fig, (ax_c, ax_r) = plt.subplots(1, 2, figsize=(10, 3.6))
@@ -243,8 +289,7 @@ def plot_gradient(groups, out):
     for ax in (ax_c, ax_r):
         ax.set_xlim(right=ax.get_xlim()[1] + 4)
     ax_c.legend(fontsize=8, loc="lower left")
-    fig.suptitle("Gradient of the augmented network on the base weights (mean over seeds and logged steps)",
-                 y=1.02)
+    fig.suptitle("Gradient of the augmented network on the base weights (mean over seeds and logged steps)", y=1.02)
     save(fig, out, "gradient.png")
 
 
@@ -252,11 +297,15 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("paths", nargs="+")
     p.add_argument("--out", default="runs/plots")
-    p.add_argument("--variant", default="netaug",
-                   help="NetAug configuration (a label from summarize.py, e.g. 'netaug init-max') "
-                        "drawn in the accuracy figures; paired_diff.png shows every configuration")
-    p.add_argument("--ref-epochs", type=int, default=None,
-                   help="pair every configuration with the baseline of this many epochs")
+    p.add_argument(
+        "--variant",
+        default="netaug",
+        help="NetAug configuration (a label from summarize.py, e.g. 'netaug init-max') "
+        "drawn in the accuracy figures; paired_diff.png shows every configuration",
+    )
+    p.add_argument(
+        "--ref-epochs", type=int, default=None, help="pair every configuration with the baseline of this many epochs"
+    )
     args = p.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

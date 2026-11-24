@@ -10,7 +10,7 @@
 
 ## 已決定（2026-11-18）
 
-- 專案已於 2026-11-23 結束：測試顯示實作符合論文的定義，但 NetAug 在本專案的 CIFAR 實驗中沒有顯著效果（見 summary.md）。
+- 專案已於 2026-11-24 結束：測試顯示實作符合論文的定義，但 NetAug 在本專案的 CIFAR 實驗中沒有顯著效果（見 summary.md）。
 
 - 通用的純 PyTorch 套件 `torchnetaug`（`src/torchnetaug/`），不依賴 ultralytics。
 - MIT 授權。不可從 `netaug/` 複製程式碼（它帶 Ultralytics GPL-3.0 檔頭）。
