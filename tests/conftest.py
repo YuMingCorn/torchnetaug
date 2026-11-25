@@ -1,10 +1,10 @@
 import copy
-from typing import Callable, Dict
+from collections.abc import Callable
 
 import pytest
 import torch
-import torch.nn as nn
 import torchvision
+from torch import nn
 
 torch.set_default_dtype(torch.float64)
 
@@ -21,6 +21,7 @@ def randomize(model: nn.Module, seed: int = 0) -> nn.Module:
         p.copy_(torch.randn(p.shape, generator=g, dtype=p.dtype) * 0.3)
     for m in model.modules():
         if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.track_running_stats:
+            assert m.running_mean is not None and m.running_var is not None
             m.running_mean.copy_(torch.randn(m.running_mean.shape, generator=g) * 0.3)
             m.running_var.copy_(torch.rand(m.running_var.shape, generator=g) + 0.5)
     return model
@@ -30,9 +31,15 @@ class ConvChain(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 8, 3, padding=1), nn.BatchNorm2d(8), nn.ReLU(),
-            nn.Conv2d(8, 16, 3, stride=2, padding=1, bias=False), nn.BatchNorm2d(16), nn.ReLU(),
-            nn.Conv2d(16, 12, 1), nn.BatchNorm2d(12), nn.ReLU6(),
+            nn.Conv2d(3, 8, 3, padding=1),
+            nn.BatchNorm2d(8),
+            nn.ReLU(),
+            nn.Conv2d(8, 16, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.Conv2d(16, 12, 1),
+            nn.BatchNorm2d(12),
+            nn.ReLU6(),
         )
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc1 = nn.Linear(12, 20)
@@ -105,7 +112,7 @@ class WithGroupNorm(nn.Module):
         return self.fc(x.mean([2, 3]))
 
 
-MODELS: Dict[str, Callable[[], nn.Module]] = {
+MODELS: dict[str, Callable[[], nn.Module]] = {
     "conv_chain": ConvChain,
     "tiny_dense": TinyDense,
     "group_norm": WithGroupNorm,
@@ -150,5 +157,10 @@ def assert_sorted(aug, rtol: float = 1e-9) -> None:
     before = aug.channel_importance()
     for g, perm in aug.sort_channels().items():
         imp = before[g]
-        torch.testing.assert_close(imp[perm], imp, rtol=rtol, atol=0,
-                                   msg=f"second sort moved a channel of group {g} past a different importance")
+        torch.testing.assert_close(
+            imp[perm],
+            imp,
+            rtol=rtol,
+            atol=0,
+            msg=f"second sort moved a channel of group {g} past a different importance",
+        )

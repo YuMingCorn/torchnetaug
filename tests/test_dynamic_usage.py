@@ -10,10 +10,12 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
-import torch.nn as nn
 from conftest import randomize
+from torch import nn
 
 from torchnetaug import (
     DynamicBatchNorm,
@@ -44,7 +46,7 @@ def _net(conv, bn, lin, w1, w2):
 @pytest.mark.parametrize("train", [False, True])
 def test_hand_built_dynamic_network_equals_plain_network(train):
     torch.manual_seed(0)
-    dyn = randomize(_net(DynamicConv2d, DynamicBatchNorm, DynamicLinear, 24, 48))
+    dyn: Any = randomize(_net(DynamicConv2d, DynamicBatchNorm, DynamicLinear, 24, 48))
     # width by hand: producers get active_out, readers get the matching input segments
     dyn.c1.active_out = 8
     dyn.b1.set_in_segments([(0, 8)])
@@ -53,7 +55,7 @@ def test_hand_built_dynamic_network_equals_plain_network(train):
     dyn.b2.set_in_segments([(0, 16)])
     dyn.fc.set_in_segments([(0, 16)])
 
-    plain = _net(nn.Conv2d, nn.BatchNorm2d, nn.Linear, 8, 16)
+    plain: Any = _net(nn.Conv2d, nn.BatchNorm2d, nn.Linear, 8, 16)
     state = {}
     for name, t in dyn.state_dict().items():
         shape = plain.state_dict()[name].shape

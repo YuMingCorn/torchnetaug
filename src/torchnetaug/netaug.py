@@ -5,11 +5,12 @@ from __future__ import annotations
 import copy
 import random
 from collections import OrderedDict
+from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, cast
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from .depth import DepthStack, make_extra
 from .graph import ChannelGraph, analyze, check_plain
@@ -18,21 +19,18 @@ from .layers import DynamicBatchNorm, DynamicConv2d, DynamicLinear, DynamicModul
 __all__ = ["NetAugModel"]
 
 # (tensor name relative to the wrapped model, dim, offset, group id)
-_PermOp = Tuple[str, int, int, int]
+_PermOp = tuple[str, int, int, int]
 
 
 def _check_no_shared_parameters(model: nn.Module, graph: ChannelGraph) -> None:
     """Refuse tied weights on a resized layer: widening would silently untie them."""
-    owners: Dict[int, List[str]] = {}
+    owners: dict[int, list[str]] = {}
     for mod_name, mod in model.named_modules(remove_duplicate=False):
         for p_name, p in mod.named_parameters(recurse=False):
             owners.setdefault(id(p), []).append(f"{mod_name}.{p_name}" if mod_name else p_name)
     for names in owners.values():
         if len(names) > 1 and any(n.rsplit(".", 1)[0] in graph.layers for n in names):
-            raise ValueError(
-                "shared (tied) parameters are not supported on layers NetAug resizes: "
-                + ", ".join(names)
-            )
+            raise ValueError("shared (tied) parameters are not supported on layers NetAug resizes: " + ", ".join(names))
 
 
 def _set_submodule(root: nn.Module, name: str, new: nn.Module) -> None:
@@ -42,15 +40,13 @@ def _set_submodule(root: nn.Module, name: str, new: nn.Module) -> None:
 
 
 @torch.no_grad()
-def _add_depth(
-    work: nn.Module, example_inputs: Any, depth: Mapping[str, int]
-) -> Tuple[List[str], List[str]]:
+def _add_depth(work: nn.Module, example_inputs: Any, depth: Mapping[str, int]) -> tuple[list[str], list[str]]:
     """Replace each chosen block of ``work`` by a :class:`DepthStack`.
 
     Returns ``(depth_paths, zeroed_bn_paths)`` where ``zeroed_bn_paths`` lists every BN
     that :func:`make_extra` zero-initialized so widening keeps all its channels at zero.
     """
-    paths: Dict[str, int] = {}
+    paths: dict[str, int] = {}
     for path, k in depth.items():
         try:
             mod = work.get_submodule(path) if path else work
@@ -74,11 +70,9 @@ def _add_depth(
                 raise ValueError(f"depth: {b!r} is inside {a!r}")
 
     # record the input and output of every chosen block on the example input
-    seen: Dict[str, List[Tuple[Any, Any]]] = {p: [] for p in paths}
+    seen: dict[str, list[tuple[Any, Any]]] = {p: [] for p in paths}
     hooks = [
-        work.get_submodule(p).register_forward_hook(
-            lambda m, args, out, p=p: seen[p].append((args, out))
-        )
+        work.get_submodule(p).register_forward_hook(lambda m, args, out, p=p: seen[p].append((args, out)))
         for p in paths
     ]
     flags = [(m, m.training) for m in work.modules()]  # keep per-module flags (frozen BN, ...)
@@ -90,7 +84,7 @@ def _add_depth(
             h.remove()
         for m, flag in flags:
             m.training = flag
-    zeroed_bns: List[str] = []
+    zeroed_bns: list[str] = []
     for p, k in paths.items():
         calls = seen[p]
         if len(calls) != 1:
@@ -145,14 +139,16 @@ class NetAugModel(nn.Module):
           depth point samples how many extra blocks run.
     """
 
+    _template: nn.Module
+
     def __init__(
         self,
         model: nn.Module,
         example_inputs: Any = None,
         width_mults: Sequence[float] = (1.0, 2.0, 3.0),
-        graph: Optional[ChannelGraph] = None,
+        graph: ChannelGraph | None = None,
         update_bn_in_aug: bool = False,
-        depth: Optional[Mapping[str, int]] = None,
+        depth: Mapping[str, int] | None = None,
     ) -> None:
         super().__init__()
         check_plain(model)
@@ -160,8 +156,8 @@ class NetAugModel(nn.Module):
         if not mults or mults[0] != 1.0:
             raise ValueError("width_mults must contain 1.0 as its smallest value")
         work = copy.deepcopy(model)
-        self._depth_paths: List[str] = []
-        zeroed_bns: List[str] = []
+        self._depth_paths: list[str] = []
+        zeroed_bns: list[str] = []
         if depth:
             if graph is not None:
                 raise ValueError("depth cannot be combined with a pre-built graph")
@@ -177,23 +173,23 @@ class NetAugModel(nn.Module):
         self.width_mults = tuple(mults)
         self.update_bn_in_aug = update_bn_in_aug
 
-        self.base_sizes: List[int] = list(graph.group_sizes)
-        self.choices: List[List[int]] = []
+        self.base_sizes: list[int] = list(graph.group_sizes)
+        self.choices: list[list[int]] = []
         for size, fixed in zip(graph.group_sizes, graph.group_fixed):
             if fixed:
                 self.choices.append([size])
             else:
                 self.choices.append(sorted({max(1, round(size * m)) for m in mults}))
-        self.max_sizes: List[int] = [c[-1] for c in self.choices]
+        self.max_sizes: list[int] = [c[-1] for c in self.choices]
 
         # Plain copy of the original model: export() loads sliced weights into a copy of it.
         self.__dict__["_template"] = copy.deepcopy(model)
 
         self.model = work
-        self.max_depths: Dict[str, int] = {p: len(self._stack(p).extra) for p in self._depth_paths}
-        self.base_depths: Dict[str, int] = {p: 0 for p in self._depth_paths}
-        self.active_depths: Dict[str, int] = dict(self.base_depths)
-        self._in_offsets: Dict[str, List[int]] = {}
+        self.max_depths: dict[str, int] = {p: len(self._stack(p).extra) for p in self._depth_paths}
+        self.base_depths: dict[str, int] = {p: 0 for p in self._depth_paths}
+        self.active_depths: dict[str, int] = dict(self.base_depths)
+        self._in_offsets: dict[str, list[int]] = {}
         for name, role in graph.layers.items():
             offsets, off = [], 0
             for g in role.in_groups:
@@ -206,19 +202,19 @@ class NetAugModel(nn.Module):
         with torch.no_grad():
             for bn_path in zeroed_bns:
                 bn = self.model.get_submodule(bn_path)
-                if getattr(bn, "weight", None) is not None:
+                if isinstance(bn.weight, torch.Tensor):
                     bn.weight.zero_()
-                if getattr(bn, "bias", None) is not None:
+                if isinstance(bn.bias, torch.Tensor):
                     bn.bias.zero_()
 
         self.mode = "base"
-        self.active_sizes: List[int] = list(self.base_sizes)
+        self.active_sizes: list[int] = list(self.base_sizes)
         self.set_base()
 
     # ------------------------------------------------------------------------------
     # construction
     # ------------------------------------------------------------------------------
-    def _base_in_index(self, name: str, device: Optional[torch.device]) -> torch.Tensor:
+    def _base_in_index(self, name: str, device: torch.device | None) -> torch.Tensor:
         role = self.graph.layers[name]
         segs = [(o, self.base_sizes[g]) for o, g in zip(self._in_offsets[name], role.in_groups)]
         return segments_index(tuple(segs), device)
@@ -230,38 +226,52 @@ class NetAugModel(nn.Module):
         p = next(old.parameters(), None)
         if p is None:
             p = next((b for b in old.buffers() if b.is_floating_point()), None)
-        fk = {"device": p.device, "dtype": p.dtype} if p is not None else {}
+        fk: dict[str, Any] = {"device": p.device, "dtype": p.dtype} if p is not None else {}
         idx = self._base_in_index(name, p.device if p is not None else None)
 
         if isinstance(old, nn.Conv2d):
-            common = dict(kernel_size=old.kernel_size, stride=old.stride, padding=old.padding,
-                          dilation=old.dilation, bias=old.bias is not None,
-                          padding_mode=old.padding_mode, **fk)
+            common = dict(
+                kernel_size=old.kernel_size,
+                stride=old.stride,
+                padding=old.padding,
+                dilation=old.dilation,
+                bias=old.bias is not None,
+                padding_mode=old.padding_mode,
+                **fk,
+            )
             if role.kind == "dense":
+                assert role.out_group is not None
                 out_max, out_base = self.max_sizes[role.out_group], self.base_sizes[role.out_group]
                 new = DynamicConv2d(in_max, out_max, groups=1, **common)
                 new.weight[:out_base].index_copy_(1, idx, old.weight)
-                if old.bias is not None:
+                if old.bias is not None and new.bias is not None:
                     new.bias[:out_base].copy_(old.bias)
             else:
                 new = DynamicConv2d(in_max, in_max, groups=in_max, **common)
                 new.weight.index_copy_(0, idx, old.weight)
-                if old.bias is not None:
+                if old.bias is not None and new.bias is not None:
                     new.bias.index_copy_(0, idx, old.bias)
         elif isinstance(old, nn.Linear):
+            assert role.out_group is not None
             out_max, out_base = self.max_sizes[role.out_group], self.base_sizes[role.out_group]
             new = DynamicLinear(in_max, out_max, bias=old.bias is not None, **fk)
             new.weight[:out_base].index_copy_(1, idx, old.weight)
-            if old.bias is not None:
+            if old.bias is not None and new.bias is not None:
                 new.bias[:out_base].copy_(old.bias)
         elif isinstance(old, nn.modules.batchnorm._BatchNorm):
-            new = DynamicBatchNorm(in_max, eps=old.eps, momentum=old.momentum, affine=old.affine,
-                                   track_running_stats=old.track_running_stats, **fk)
+            new = DynamicBatchNorm(
+                in_max,
+                eps=old.eps,
+                momentum=old.momentum,
+                affine=old.affine,
+                track_running_stats=old.track_running_stats,
+                **fk,
+            )
             for attr in ("weight", "bias", "running_mean", "running_var"):
                 src = getattr(old, attr)
                 if src is not None:
                     getattr(new, attr).index_copy_(0, idx, src)
-            if old.track_running_stats:
+            if old.track_running_stats and new.num_batches_tracked is not None and old.num_batches_tracked is not None:
                 new.num_batches_tracked.copy_(old.num_batches_tracked)
         else:  # pragma: no cover - the analysis only emits the types above
             raise TypeError(f"cannot widen {type(old).__name__}")
@@ -270,9 +280,9 @@ class NetAugModel(nn.Module):
         new.train(old.training)
         return new
 
-    def dynamic_layers(self) -> Iterator[Tuple[str, DynamicModule]]:
+    def dynamic_layers(self) -> Iterator[tuple[str, DynamicModule]]:
         for name in self.graph.layers:
-            yield name, self.model.get_submodule(name)
+            yield name, cast(DynamicModule, self.model.get_submodule(name))
 
     def num_active_params(self) -> int:
         """Number of parameters the current width uses.
@@ -281,8 +291,7 @@ class NetAugModel(nn.Module):
         (for the base sizes: the parameter count of ``export()``).
         """
         dyn = dict(self.dynamic_layers())
-        off = [f"{p}.extra.{i}" for p, d in self.active_depths.items()
-               for i in range(d, self.max_depths[p])]
+        off = [f"{p}.extra.{i}" for p, d in self.active_depths.items() for i in range(d, self.max_depths[p])]
         total = 0
         for name, mod in self.model.named_modules():
             if any(name == o or name.startswith(o + ".") for o in off):
@@ -290,7 +299,8 @@ class NetAugModel(nn.Module):
             if name in dyn:
                 if isinstance(mod, (DynamicConv2d, DynamicLinear)):
                     total += mod.active_weight().numel()
-                    total += 0 if mod.bias is None else mod.active_bias().numel()
+                    b = mod.active_bias()
+                    total += 0 if b is None else b.numel()
                 elif mod.affine:  # batch norm: one weight and one bias per channel
                     total += 2 * mod.active_in
             elif not any(name.startswith(d + ".") for d in dyn):
@@ -301,18 +311,18 @@ class NetAugModel(nn.Module):
     # width control
     # ------------------------------------------------------------------------------
     def _stack(self, path: str) -> DepthStack:
-        return self.model.get_submodule(path)
+        return cast(DepthStack, self.model.get_submodule(path))
 
     @property
     def is_base(self) -> bool:
         """True when the active network is the original tiny model."""
         return self.active_sizes == self.base_sizes and self.active_depths == self.base_depths
 
-    def state(self) -> Tuple[List[int], Dict[str, int], str]:
+    def state(self) -> tuple[list[int], dict[str, int], str]:
         """The active widths, depths and mode; :meth:`set_state` restores them."""
         return list(self.active_sizes), dict(self.active_depths), self.mode
 
-    def set_state(self, state: Tuple[Sequence[int], Mapping[str, int], str]) -> None:
+    def set_state(self, state: tuple[Sequence[int], Mapping[str, int], str]) -> None:
         sizes, depths, mode = state
         self._apply_state(sizes, depths, mode)
 
@@ -337,10 +347,8 @@ class NetAugModel(nn.Module):
         update = self.is_base or self.update_bn_in_aug
         for name, layer in self.dynamic_layers():
             role = self.graph.layers[name]
-            layer.set_in_segments(
-                [(o, self.active_sizes[g]) for o, g in zip(self._in_offsets[name], role.in_groups)]
-            )
-            if role.kind == "dense":
+            layer.set_in_segments([(o, self.active_sizes[g]) for o, g in zip(self._in_offsets[name], role.in_groups)])
+            if role.kind == "dense" and role.out_group is not None:
                 layer.active_out = self.active_sizes[role.out_group]
             if isinstance(layer, DynamicBatchNorm):
                 layer.update_stats = update
@@ -375,7 +383,7 @@ class NetAugModel(nn.Module):
         base = sizes == self.base_sizes and self.active_depths == self.base_depths
         self._apply_state(sizes, self.active_depths, "base" if base else "custom")
 
-    def set_random(self, generator: Optional[random.Random] = None, granularity: str = "group") -> None:
+    def set_random(self, generator: random.Random | None = None, granularity: str = "group") -> None:
         """Sample an augmented model.
 
         ``granularity="group"`` samples each free group on its own (a ResNet stage, an
@@ -389,17 +397,14 @@ class NetAugModel(nn.Module):
             sizes = [rng.choice(c) for c in self.choices]
         elif granularity == "global":
             m = rng.choice(self.width_mults)
-            sizes = [
-                b if fixed else max(1, round(b * m))
-                for b, fixed in zip(self.base_sizes, self.graph.group_fixed)
-            ]
+            sizes = [b if fixed else max(1, round(b * m)) for b, fixed in zip(self.base_sizes, self.graph.group_fixed)]
         else:
             raise ValueError("granularity must be 'group' or 'global'")
         depths = {p: rng.randint(0, k) for p, k in self.max_depths.items()}
         self._apply_state(sizes, depths, "random")
 
     @contextmanager
-    def mode_ctx(self, mode: str, **kwargs: Any) -> Iterator["NetAugModel"]:
+    def mode_ctx(self, mode: str, **kwargs: Any) -> Generator[NetAugModel, None, None]:
         """Temporarily switch mode (``"base"``, ``"max"`` or ``"random"``)."""
         previous = self.state()
         getattr(self, f"set_{mode}")(**kwargs)
@@ -415,9 +420,7 @@ class NetAugModel(nn.Module):
     # export
     # ------------------------------------------------------------------------------
     @torch.no_grad()
-    def export(
-        self, sizes: Optional[Sequence[int]] = None, depths: Optional[Mapping[str, int]] = None
-    ) -> nn.Module:
+    def export(self, sizes: Sequence[int] | None = None, depths: Mapping[str, int] | None = None) -> nn.Module:
         """Return a plain PyTorch model holding the weights of one width and depth.
 
         Without arguments (or with the base sizes and depths) the result is a copy of the
@@ -438,8 +441,9 @@ class NetAugModel(nn.Module):
                 prefix = name + "."
                 if isinstance(layer, (DynamicConv2d, DynamicLinear)):
                     state[prefix + "weight"] = layer.active_weight()
-                    if layer.bias is not None:
-                        state[prefix + "bias"] = layer.active_bias()
+                    b = layer.active_bias()
+                    if b is not None:
+                        state[prefix + "bias"] = b
                 else:
                     for attr in ("weight", "bias", "running_mean", "running_var"):
                         if getattr(layer, attr) is not None:
@@ -454,22 +458,23 @@ class NetAugModel(nn.Module):
             meta = getattr(state, "_metadata", None)
             if meta is not None:
                 meta = OrderedDict(
-                    (self._template_name(k) if k else k, v) for k, v in meta.items()
+                    (self._template_name(k) if k else k, v)
+                    for k, v in meta.items()
                     if not k or self._template_name(k) is not None
                 )
-            cloned._metadata = meta  # type: ignore[attr-defined]
+            cloned.__dict__["_metadata"] = meta
             out.load_state_dict(cloned, assign=True)  # keep the model's dtype (e.g. after .double())
             # buffers outside the state_dict (persistent=False) follow the model too
-            model_buffers = {self._template_name(k): v
-                             for k, v in self.model.named_buffers(remove_duplicate=False)}
-            copies: Dict[int, torch.Tensor] = {}  # one copy per model tensor: ties follow the model
+            model_buffers = {self._template_name(k): v for k, v in self.model.named_buffers(remove_duplicate=False)}
+            copies: dict[int, torch.Tensor] = {}  # one copy per model tensor: ties follow the model
             for name, buf in list(out.named_buffers(remove_duplicate=False)):
                 src = model_buffers.get(name)
                 if name in cloned or src is None or not buf.is_floating_point():
                     continue
                 if id(src) not in copies:
-                    copies[id(src)] = (src.detach().clone() if src.shape == buf.shape
-                                       else buf.to(device=src.device, dtype=src.dtype))
+                    copies[id(src)] = (
+                        src.detach().clone() if src.shape == buf.shape else buf.to(device=src.device, dtype=src.dtype)
+                    )
                 owner_name, _, attr = name.rpartition(".")
                 owner = out.get_submodule(owner_name) if owner_name else out
                 owner._buffers[attr] = copies[id(src)]
@@ -477,8 +482,9 @@ class NetAugModel(nn.Module):
         if p is not None:
             out.to(p.device)
         # preserve per-module requires_grad and training flags (e.g. frozen BN / weights)
-        model_params = {self._template_name(k): param
-                        for k, param in self.model.named_parameters(remove_duplicate=False)}
+        model_params = {
+            self._template_name(k): param for k, param in self.model.named_parameters(remove_duplicate=False)
+        }
         for name, param in out.named_parameters(remove_duplicate=False):
             src = model_params.get(name)
             if src is not None:
@@ -490,7 +496,7 @@ class NetAugModel(nn.Module):
                 out.get_submodule(tname).training = mod.training
         return out
 
-    def _template_name(self, name: str) -> Optional[str]:
+    def _template_name(self, name: str) -> str | None:
         """Name in the original model of a tensor or module of ``self.model``.
 
         For a depth point ``P``: ``P.block.x`` -> ``P.x``, ``P.block`` -> ``P``, and names
@@ -500,7 +506,7 @@ class NetAugModel(nn.Module):
             if name == p + ".block":
                 return p
             if name.startswith(p + ".block."):
-                return p + "." + name[len(p) + len(".block."):]
+                return p + "." + name[len(p) + len(".block.") :]
             if name == p or name == p + ".extra" or name.startswith(p + ".extra."):
                 return None
         return name
@@ -509,9 +515,9 @@ class NetAugModel(nn.Module):
         """Name in the original model of the layer that ``name`` is (or copies)."""
         for p in self._depth_paths:
             if name == p + ".block" or name.startswith(p + ".block."):
-                return p + name[len(p + ".block"):]
+                return p + name[len(p + ".block") :]
             if name.startswith(p + ".extra."):
-                _, _, rest = name[len(p + ".extra."):].partition(".")  # drop the copy index
+                _, _, rest = name[len(p + ".extra.") :].partition(".")  # drop the copy index
                 return p + ("." + rest if rest else "")
         return name
 
@@ -523,43 +529,61 @@ class NetAugModel(nn.Module):
             for name, layer in self.dynamic_layers():
                 _set_submodule(out, name, self._plain_layer(name, layer))
             for p in self._depth_paths:
-                _set_submodule(out, p, out.get_submodule(p).to_plain())
+                _set_submodule(out, p, cast(DepthStack, out.get_submodule(p)).to_plain())
         finally:
             self.set_state(previous)
         return out
 
     def _plain_layer(self, name: str, layer: DynamicModule) -> nn.Module:
         """A plain layer of the original layer's class holding ``layer``'s active slice."""
-        cls = type(self._template.get_submodule(self._template_layer_name(name)))
+        cls: Any = type(self._template.get_submodule(self._template_layer_name(name)))
         n_in = layer.active_in
         tensors = list(layer.parameters()) + list(layer.buffers())
         device = tensors[0].device if tensors else torch.device("cpu")
         fp = next((t for t in tensors if t.is_floating_point()), None)
         dtype = fp.dtype if fp is not None else None
-        fk = {"device": device, "dtype": dtype}
+        fk: dict[str, Any] = {"device": device, "dtype": dtype}
         with torch.no_grad():
             if isinstance(layer, DynamicConv2d):
                 n_out = n_in if layer.depthwise else layer.active_out
-                new = cls(n_in, n_out, layer.kernel_size, layer.stride, layer.padding, layer.dilation,
-                          groups=n_in if layer.depthwise else 1, bias=layer.bias is not None,
-                          padding_mode=layer.padding_mode, **fk)
+                new: Any = cls(
+                    n_in,
+                    n_out,
+                    layer.kernel_size,
+                    layer.stride,
+                    layer.padding,
+                    layer.dilation,
+                    groups=n_in if layer.depthwise else 1,
+                    bias=layer.bias is not None,
+                    padding_mode=layer.padding_mode,
+                    **fk,
+                )
                 new.weight.copy_(layer.active_weight())
-                if layer.bias is not None:
-                    new.bias.copy_(layer.active_bias())
+                b = layer.active_bias()
+                if b is not None:
+                    new.bias.copy_(b)
             elif isinstance(layer, DynamicLinear):
                 new = cls(n_in, layer.active_out, bias=layer.bias is not None, **fk)
                 new.weight.copy_(layer.active_weight())
-                if layer.bias is not None:
-                    new.bias.copy_(layer.active_bias())
+                b = layer.active_bias()
+                if b is not None:
+                    new.bias.copy_(b)
             else:
-                new = cls(n_in, eps=layer.eps, momentum=layer.momentum, affine=layer.affine,
-                          track_running_stats=layer.track_running_stats, **fk)
+                assert isinstance(layer, DynamicBatchNorm)
+                new = cls(
+                    n_in,
+                    eps=layer.eps,
+                    momentum=layer.momentum,
+                    affine=layer.affine,
+                    track_running_stats=layer.track_running_stats,
+                    **fk,
+                )
                 for attr in ("running_mean", "running_var"):
                     if getattr(layer, attr) is not None:
                         getattr(new, attr).copy_(layer._select_in(getattr(layer, attr), 0))
                 if layer.num_batches_tracked is not None:
                     new.num_batches_tracked.copy_(layer.num_batches_tracked)
-                if layer.affine:
+                if layer.affine and layer.weight is not None and layer.bias is not None:
                     new.weight.copy_(layer._select_in(layer.weight, 0))
                     new.bias.copy_(layer._select_in(layer.bias, 0))
         for (_, p_old), (_, p_new) in zip(layer.named_parameters(), new.named_parameters()):
@@ -570,13 +594,13 @@ class NetAugModel(nn.Module):
     # ------------------------------------------------------------------------------
     # channel sorting
     # ------------------------------------------------------------------------------
-    def _perm_ops(self) -> Dict[int, List[_PermOp]]:
+    def _perm_ops(self) -> dict[int, list[_PermOp]]:
         """For each free group, list every tensor slice that carries its channels."""
-        ops: Dict[int, List[_PermOp]] = {g: [] for g in self.graph.free_groups()}
+        ops: dict[int, list[_PermOp]] = {g: [] for g in self.graph.free_groups()}
         for name, layer in self.dynamic_layers():
             role = self.graph.layers[name]
             if role.kind == "dense":
-                if role.out_group in ops:
+                if role.out_group is not None and role.out_group in ops:
                     ops[role.out_group].append((f"{name}.weight", 0, 0, role.out_group))
                     if layer.bias is not None:
                         ops[role.out_group].append((f"{name}.bias", 0, 0, role.out_group))
@@ -595,14 +619,14 @@ class NetAugModel(nn.Module):
         return ops
 
     @torch.no_grad()
-    def channel_importance(self) -> Dict[int, torch.Tensor]:
+    def channel_importance(self) -> dict[int, torch.Tensor]:
         """L1 importance of each channel of each free group (max-width layout).
 
         A channel is important if the layers that *read* it give it large weights. If a
         group has no dense reader, the producers' output weights are used instead.
         """
         tensors = dict(self.model.named_parameters())
-        result: Dict[int, torch.Tensor] = {}
+        result: dict[int, torch.Tensor] = {}
         for g, ops in self._perm_ops().items():
             size = self.max_sizes[g]
             readers = [(n, d, o) for n, d, o, _ in ops if d == 1]
@@ -621,9 +645,9 @@ class NetAugModel(nn.Module):
     @torch.no_grad()
     def sort_channels(
         self,
-        optimizer: Optional[torch.optim.Optimizer] = None,
-        extra_models: Iterable["NetAugModel"] = (),
-    ) -> Dict[int, torch.Tensor]:
+        optimizer: torch.optim.Optimizer | None = None,
+        extra_models: Iterable[NetAugModel] = (),
+    ) -> dict[int, torch.Tensor]:
         """Reorder channels so the most important ones come first.
 
         Every free group gets one permutation, applied to every tensor that carries the
@@ -647,10 +671,10 @@ class NetAugModel(nn.Module):
 
     @torch.no_grad()
     def apply_permutations(
-        self, perms: Dict[int, torch.Tensor], optimizer: Optional[torch.optim.Optimizer] = None
+        self, perms: dict[int, torch.Tensor], optimizer: torch.optim.Optimizer | None = None
     ) -> None:
         """Apply ``{group_id: permutation}``: new channel ``i`` = old channel ``perm[i]``."""
-        tensors: Dict[str, torch.Tensor] = dict(self.model.named_parameters())
+        tensors: dict[str, torch.Tensor] = dict(self.model.named_parameters())
         tensors.update(dict(self.model.named_buffers()))
         params = dict(self.model.named_parameters())
         for g, ops in self._perm_ops().items():
@@ -661,8 +685,7 @@ class NetAugModel(nn.Module):
                 targets = [tensors[name]]
                 if optimizer is not None and name in params:
                     state = optimizer.state.get(params[name], {})
-                    targets += [v for v in state.values()
-                                if torch.is_tensor(v) and v.shape == params[name].shape]
+                    targets += [v for v in state.values() if torch.is_tensor(v) and v.shape == params[name].shape]
                 for t in targets:
                     idx = torch.arange(off, off + perm.numel(), device=t.device)
                     src = t.index_select(dim, idx[perm.to(t.device)])

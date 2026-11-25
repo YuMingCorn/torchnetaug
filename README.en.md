@@ -2,36 +2,41 @@
 
 [繁體中文](README.md) | **English**
 
-A pure-PyTorch implementation of **Network Augmentation (NetAug)**.
+A pure-PyTorch implementation of [Network Augmentation (NetAug)](https://arxiv.org/abs/2110.08890) (Cai et al., ICLR 2022).
 
-> **Project status: finished (2026-11-23).** The tests show that the implementation computes the paper's definition, but in the CIFAR experiments of this project NetAug did not significantly improve the test accuracy of tiny models. See [summary.en.md](summary.en.md).
+> **Project finished (2026-11-24).** The implementation matches the paper, but NetAug gave no significant gain in the CIFAR experiments of this project. See [summary.en.md](summary.en.md).
 
-NetAug comes from the paper [*Network Augmentation for Tiny Deep Learning*](https://arxiv.org/abs/2110.08890) by Han Cai et al. (ICLR 2022). The usual problem of a tiny model is **underfitting**, not overfitting. During training, NetAug embeds the tiny model in wider models and trains them together, so the tiny model gets extra supervision. After training, only the tiny model is exported, so **the inference cost does not change**.
+## Key points
 
-Features:
+1. **How NetAug works**: the usual problem of small models is underfitting. During training, NetAug puts the base model inside wider networks that share its weights, and trains them together. Deployment uses only the base model, so the inference cost does not change.
+2. **Works with any plain PyTorch model**: `torch.fx` analyzes the channel structure automatically (residuals, concat, depthwise). Tests cover torchvision ResNet, MobileNetV2/V3, ShuffleNetV2, EfficientNet and MnasNet.
+3. **Sorting does not change the function**: sorting works per channel group. The two sides of a residual use the same permutation.
+4. **Export to the original class**: `export()` returns your original model class. The deployment side does not need this package.
+5. **One-line change to the training loop**: replace `loss.backward()` with `netaug_step(...)`. Depth augmentation (`depth=`) is optional.
 
-- **Any model, composed the normal PyTorch way**: build your network from ordinary `torch.nn` layers. `torch.fx` analyzes the channel structure automatically (which layers share channels, residuals, concat). Width switching, channel sorting and export are all automatic. You do not need to write a dynamic version of the model by hand. torchvision ResNet, MobileNetV2/V3, EfficientNet, DenseNet and MnasNet work directly (tests cover ResNet18, MobileNetV2/V3, ShuffleNetV2 and EfficientNet-B0; MnasNet has an export test).
-- **Safe channel sorting on residual networks too**: sorting works per "channel group". The two sides of a residual always use the same permutation, so the function of the max-width network does not change.
-- **Export to the original class**: `export()` returns your original model class. The deployment side does not need this package.
-- **Width and depth augmentation**: besides the width augmentation of the paper, you can add extra blocks after chosen blocks (depth augmentation, based on the elastic depth of Once-for-All).
-- **No change to your training loop**: replace one line, `loss.backward()`, with `netaug_step(...)`.
+```mermaid
+flowchart LR
+    M["base model"] --> N["NetAugModel<br/>(dynamic model)"]
+    N --> T["training loop<br/>netaug_step"]
+    T -- "every N epochs" --> S["sort_channels"]
+    S --> T
+    T --> B["recalibrate_bn"]
+    B --> E["export()"]
+    E --> D["base model class<br/>(deployable)"]
+```
 
-For the code design, see [docs/design.en.md](docs/design.en.md). For the experiment results, see [docs/experiments.en.md](docs/experiments.en.md). For the term list, see [docs/glossary.md](docs/glossary.md).
+For design and correctness, see [design.en.md](docs/design.en.md). For experiments, see [experiments.en.md](docs/experiments.en.md). For terms, see [glossary.md](docs/glossary.md).
 
 ## Installation
 
 Requires Python 3.10 or later and PyTorch 2.4 or later.
 
 ```bash
-# in the project root
-uv sync                 # development environment (includes pytest, torchvision)
-# or
-pip install -e .
+uv sync            # development environment (includes pytest, torchvision)
+pip install -e .   # or install only the package
 ```
 
 ## Quick start
-
-Below is the full training flow. Replace the fake data with your DataLoader.
 
 ```python
 import random
@@ -40,20 +45,19 @@ import torch.nn as nn
 import torchvision
 from torchnetaug import NetAugModel, netaug_step, recalibrate_bn
 
-# 1. Your tiny model
+# 1. Base model
 tiny = torchvision.models.mobilenet_v2(width_mult=0.35, num_classes=10)
 
-# 2. Wrap it as a NetAug model: the smallest width multiplier must be 1.0 (the original width)
+# 2. Wrap: the smallest width multiplier must be 1.0 (the original width)
 example = torch.randn(2, 3, 32, 32)
 model = NetAugModel(tiny, example, width_mults=(1.0, 2.0, 3.0))
 
 optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
 criterion = nn.CrossEntropyLoss()
 rng = random.Random(0)                      # random numbers for sampling augmented networks
-
 fake_loader = [(torch.randn(8, 3, 32, 32), torch.randint(0, 10, (8,))) for _ in range(3)]
 
-# 3. Train: each step = base loss + alpha × the loss of one random augmented network
+# 3. Train: each step = base loss + alpha × augmented loss
 for epoch in range(2):
     model.train()
     for images, labels in fake_loader:
@@ -64,7 +68,7 @@ for epoch in range(2):
 # 4. Before evaluation or export, re-estimate the BN statistics at base width
 recalibrate_bn(model, [images for images, _ in fake_loader])
 
-# 5. Export: returns a torchvision MobileNetV2 with exactly the same shapes as the original tiny
+# 5. Export: returns a torchvision MobileNetV2 with the same shapes as tiny
 deploy = model.export().eval()
 assert type(deploy) is torchvision.models.MobileNetV2
 
@@ -76,42 +80,37 @@ fresh = torchvision.models.mobilenet_v2(width_mult=0.35, num_classes=10)
 fresh.load_state_dict(torch.load(path))
 ```
 
-## Module usage
+## API
 
-### `NetAugModel`: wrap your model
+### `NetAugModel`
+
+The wrapper copies the model and replaces the augmentable layers with dynamic layers. The original weights go into the leading part. So in base mode, the output equals the output of the original model.
 
 ```python
 model = NetAugModel(
-    tiny,                     # original tiny model (not modified)
-    example,                  # example input for shape tracing; must be on the same device as the model
+    tiny,                     # base model (not modified)
+    example,                  # example input, on the same device as the model
     width_mults=(1.0, 2.0, 3.0),
     update_bn_in_aug=False,   # default: augmented networks do not update BN running statistics
 )
-print(model.graph.summary())  # size of each channel group, whether it is fixed, and why
-```
+print(model.graph.summary())  # size of each channel group, and why it is fixed
 
-On construction, the wrapper copies the model, replaces the augmentable layers with dynamic layers that store weights at max width, and copies the original weights into the leading part. So in base mode, the output is exactly the same as the original model:
-
-```python
 tiny.eval(); model.eval()
 with torch.no_grad():
     assert torch.allclose(model(example), tiny(example), atol=1e-5)
 ```
 
-Common attributes:
-
 | Attribute | Meaning |
 |---|---|
-| `model.model` | The internal dynamic model (a copy of the original model, with some layers replaced by dynamic layers) |
+| `model.model` | The dynamic model (a copy of the original model, with some layers replaced by dynamic layers) |
 | `model.graph` | The channel analysis result, a `ChannelGraph` |
-| `model.base_sizes` / `model.max_sizes` | The original width and max width of each group |
-| `model.choices` | The width choices of each group |
+| `model.base_sizes` / `model.max_sizes` / `model.choices` | The original width, max width and width choices of each group |
 | `model.active_sizes` / `model.mode` | The current width and mode (`"base"`, `"max"`, `"random"`, `"custom"`) |
-| `model.base_depths` / `model.max_depths` / `model.active_depths` | The number of extra blocks at each depth point (0 for base; an empty dict when `depth=` is not used) |
+| `model.base_depths` / `model.max_depths` / `model.active_depths` | The number of extra blocks at each depth point |
 
 ### Composing your own network
 
-You do not need to inherit from a specific class or use this package's layers. Use ordinary `torch.nn` layers, write `__init__` and `forward` the normal PyTorch way, and pass the model to `NetAugModel`. The network below has concat, a depthwise conv and a residual addition:
+Use ordinary `torch.nn` layers and write `__init__` and `forward` as usual. You do not need to write code for sorting or width switching. Do not pass a model that already contains dynamic layers (such as `DynamicConv2d`). Such a model gives a `TypeError`.
 
 ```python
 class Branches(nn.Module):
@@ -153,18 +152,13 @@ class MyNet(nn.Module):
 
 mine = MyNet()
 my_model = NetAugModel(mine, example, width_mults=(1.0, 2.0))
-my_model.sort_channels()          # the two concat segments, both residual sides and the depthwise conv all get consistent permutations
-my_deploy = my_model.export()     # still a MyNet, with the same shapes as mine
-assert type(my_deploy) is MyNet
+my_model.sort_channels()          # concat segments, both residual sides and depthwise get consistent permutations automatically
+assert type(my_model.export()) is MyNet
 ```
-
-There is no code here that says "how to sort each kind of block". The analysis finds the relations between channels automatically: which layers read the same channels, where each segment after a concat comes from, and which residual sides must match. Sorting and width switching both follow this result.
-
-Do **not** build a network yourself from dynamic layers such as `DynamicConv2d` and then pass it to `NetAugModel`. `NetAugModel` creates the dynamic layers itself. A model that already contains dynamic layers gives a `TypeError`, and the message names the layer.
 
 ### Depth augmentation (`depth=`)
 
-The paper and the official implementation augment only width. This package also provides depth augmentation, based on Once-for-All (elastic depth) from the same research group: it adds `k` extra blocks after a chosen block. An augmented network runs a random number `0..k` of them, starting from the first. The base network runs none of them.
+Depth augmentation adds `k` extra blocks after a chosen block. An augmented network runs a random number `0..k` of them, starting from the first. The base model runs none of them. The method follows the elastic depth of Once-for-All. For the theory, see [design.en.md Section 7](docs/design.en.md#7-depth-augmentation).
 
 ```python
 res = torchvision.models.resnet18(num_classes=10)
@@ -172,46 +166,45 @@ deep = NetAugModel(res, example, width_mults=(1.0, 2.0), depth={"layer1": 1, "la
 print(deep.max_depths)            # {'layer1.1': 1, 'layer3.1': 2}
 
 deep.set_random(rng)              # sample width and depth together
-deep.set_depths({"layer3.1": 2})  # set depth by hand; width does not change
-deep.set_base()                   # the original ResNet-18: no extra blocks
+deep.set_depths({"layer3.1": 2})  # change only the depth
+deep.set_base()                   # the original ResNet-18
 assert type(deep.export()) is type(res)
 ```
 
-- The key is a module path, and the value is the number of extra blocks. When the path points to a container whose class is exactly `nn.Sequential` (for example, the ResNet stage `"layer1"`), it means the last block of that container. A subclass of `nn.Sequential` (for example, torchvision's `Conv2dNormActivation`) counts as one block. A module without parameters (for example, a standalone ReLU) cannot be repeated.
-- The block must keep the shape of its input (the same number of channels and the same spatial size), and it must run only once per forward. Otherwise, construction gives a `ValueError`.
-- An extra block is a copy of the block with re-initialized weights. If it is a residual block, the weight of the last BN in the copy is set to 0, so the copy starts as the identity function. So the deeper network starts with the same function as the base network.
-- The output of an extra block belongs to the same channel group as the output of the original block. So the layers after it read the channels in the same order whether or not the extra blocks run, and sorting is correct at every depth.
-- `export()` without arguments still returns the original model class. `export(sizes, depths)` replaces each depth point with `nn.Sequential(block, *extra blocks)`, which is still a plain PyTorch model.
+- The key is a module path. When the path points to a container whose class is exactly `nn.Sequential`, it means the last block of that container. A subclass of `nn.Sequential` (such as `Conv2dNormActivation`) counts as one block. A module with no parameters (such as a lone ReLU) cannot be repeated.
+- The block must keep the shape of its input and run only once per forward. Otherwise, you get a `ValueError`.
 
 ### Switching width
 
 ```python
-model.set_base()                          # the original tiny model (use this for evaluation and export)
-model.set_max()                           # all groups at max width
-model.set_random(rng)                     # each group samples its own width
+model.set_base()                             # base model (use this for evaluation and export)
+model.set_max()                              # max-width network
+model.set_random(rng)                        # each group samples its own width
 model.set_random(rng, granularity="global")  # the whole model samples one multiplier
-model.set_width(1.5)                      # multiply all augmentable groups by 1.5 (need not be in width_mults)
-n_params = model.num_active_params()      # number of parameters actually used at the current width (and depth)
-model.set_sizes(model.base_sizes)         # set the width of each group by hand (mode becomes "custom")
+model.set_width(1.5)                         # multiply all augmentable groups by 1.5
+n_params = model.num_active_params()         # number of parameters used at the current width and depth
+model.set_sizes(model.base_sizes)            # set the width of each group by hand
 assert model.mode == "custom"
 
 model.set_base()
-with model.mode_ctx("max"):               # temporary switch; on exit, restores the width and mode from before entry
+with model.mode_ctx("max"):                  # temporary switch; restored on exit
     wide_out = model(example)
 assert model.mode == "base"
 
-state = model.state()                     # (width, depth, mode); set_state(state) restores it
+state = model.state()                        # (width, depth, mode); set_state(state) restores it
 ```
 
 For multi-GPU training, give each process a `random.Random` with the **same seed**. Then all GPUs sample the same augmented network.
 
-### `netaug_step`: one training step
+### `netaug_step`
+
+It only does the forward and backward passes. You call `optimizer.step()`, so gradient accumulation, gradient clipping and learning-rate schedules do not change. At the end, the model returns to base mode. For mixed precision or a custom forward, use the `forward=` and `backward=` arguments. It unwraps the `.module` of `DistributedDataParallel` automatically (DDP is not tested yet).
 
 ```python
 base_loss, aug_loss = netaug_step(
     model, images, labels, criterion,
-    alpha=1.0,          # weight of the augmentation loss (the paper uses 1.0)
-    augment=True,       # False: train only the base (e.g. stop augmentation late in training)
+    alpha=1.0,          # weight of the augmented loss (the paper uses 1.0)
+    augment=True,       # False: train only the base model
     generator=rng,
     granularity="group",
 )
@@ -219,123 +212,65 @@ optimizer.step()
 optimizer.zero_grad()
 ```
 
-It only does the forward and backward passes. You call `optimizer.step()`, so gradient accumulation, gradient clipping and learning-rate schedules stay as you wrote them. At the end, the model returns to base mode.
+### `sort_channels`
 
-Mixed precision or a custom forward:
-
-```python
-# doc: skip  (requires CUDA)
-scaler = torch.amp.GradScaler()
-
-def fwd(m, x):
-    with torch.autocast("cuda", dtype=torch.float16):
-        return m(x)
-
-netaug_step(model, images, labels, criterion, generator=rng,
-            forward=fwd, backward=lambda loss: scaler.scale(loss).backward())
-scaler.step(optimizer)
-scaler.update()
-optimizer.zero_grad()
-```
-
-`netaug_step` unwraps the `.module` of `DistributedDataParallel` automatically. (DDP is not tested yet.)
-
-### `sort_channels`: sort channels by importance
-
-Move the important channels to the front at regular intervals, so the base model gets the most useful channels. Call it between epochs, and pass the optimizer so that its state (such as momentum) is reordered too:
-
-```python
-perms = model.sort_channels(optimizer=optimizer)   # returns {group index: permutation}
-```
-
-If you have an EMA model (or another `NetAugModel` with the same structure), pass it too. It gets the same permutations:
+Between epochs, this moves the important channels to the front. Pass the optimizer, and its state (such as momentum) is reordered too. Models in `extra_models` (such as an EMA model) get the same permutations. Sorting does not change the output of the max-width network. It does change the output of the base model, so continue training after sorting. Do not sort right before export. For the theory, see [design.en.md Section 5](docs/design.en.md#5-channel-sorting).
 
 ```python
 import copy
+
 ema = copy.deepcopy(model)
-model.sort_channels(optimizer=optimizer, extra_models=[ema])
+perms = model.sort_channels(optimizer=optimizer, extra_models=[ema])   # {group index: permutation}
 ```
 
-Sorting guarantees that the output at **max width** does not change, but it changes the base output (this is the purpose of sorting). So continue training after sorting. Do not sort just before export. For the theory, see [docs/design.en.md Section 5](docs/design.en.md#5-channel-sorting).
+### `recalibrate_bn`
 
-### `recalibrate_bn`: re-estimate BN statistics
+By default, it re-estimates the running statistics of all BN layers in base mode. Then it restores the width and depth. A batch can be `(inputs, targets)` or a single tensor. For other formats, use `forward=`. Use training data with data augmentation turned off.
 
-```python
-recalibrate_bn(model, [images for images, _ in fake_loader], num_batches=100)
-```
-
-- By default, it switches to base mode, re-estimates the running statistics of all BN layers with a cumulative average, and then restores the original width and depth.
-- Each batch can be `(inputs, targets)` or a single tensor. For other formats, pass `forward=lambda m, batch: m(batch["image"])`.
-- Use training data with data augmentation turned off.
-
-To evaluate other widths (for example, to check that accuracy changes smoothly with width), set the width with `sizes=`. All widths share one set of BN buffers, so recalibrate on a **copy**. This keeps the base statistics from being overwritten:
+To evaluate other widths or depths, set them with `sizes=` or `depths=`. All widths share the BN buffers, so recalibrate on a **copy**:
 
 ```python
-import copy
-
 calib = [images for images, _ in fake_loader]
+recalibrate_bn(model, calib, num_batches=100)
+
 for mult in (1.0, 2.0, 3.0):
     sub = copy.deepcopy(model)
     sub.set_width(mult)
     recalibrate_bn(sub, calib, sizes=sub.active_sizes)
     sub.eval()
     with torch.no_grad():
-        logits = sub(example)          # evaluate at this width
-```
+        logits = sub(example)
 
-With depth augmentation, set the depth with `depths=`. The forward passes of augmented networks do not update BN statistics, so the BN layers of extra blocks get correct statistics only here:
-
-```python
 deep_eval = copy.deepcopy(deep)
-recalibrate_bn(deep_eval, calib, depths=deep_eval.max_depths)   # base width, all extra blocks
+recalibrate_bn(deep_eval, calib, depths=deep_eval.max_depths)   # BN layers of extra blocks get statistics only here
 ```
 
-### `export`: export the tiny model
+### `export`
+
+It returns a copy of the original class, on the same device and dtype as `model`. You can use `torch.save`, `torch.compile` or convert it to ONNX as usual (see `tests/test_onnx.py`). `export(sizes, depths)` exports other widths or depths, and the result is still a plain PyTorch model. Before export, recalibrate BN at that width.
 
 ```python
 deploy = model.export().eval()
 assert type(deploy) is type(tiny)
-assert {k: v.shape for k, v in deploy.state_dict().items()} == {k: v.shape for k, v in tiny.state_dict().items()}
-```
 
-It returns a copy of the original class on the same device as `model`. After that, you can use `torch.save`, `torch.onnx.export` or `torch.compile` as with any model.
-
-You can also export other widths. First recalibrate BN at that width, then pass `sizes`:
-
-```python
 wide = copy.deepcopy(model)
 wide.set_width(2.0)
 recalibrate_bn(wide, calib, sizes=list(wide.active_sizes))
-deploy_x2 = wide.export(wide.active_sizes).eval()   # plain PyTorch model, 2× wide
-print(sum(p.numel() for p in deploy_x2.parameters()), "parameters")
-```
+deploy_x2 = wide.export(wide.active_sizes).eval()   # 2× wide
 
-An export at a non-base width keeps the structure and `forward` of the original model. It only replaces the resized layers with plain layers of the same class at the active size. The exported layers keep the dtype (for example, bfloat16) and device of the model.
-
-With depth augmentation, export a deeper network with `depths=`:
-
-```python
 deploy_deep = deep_eval.export(deep_eval.base_sizes, deep_eval.max_depths).eval()
 assert not any(type(m).__module__.startswith("torchnetaug") for m in deploy_deep.modules())
 ```
 
-You can convert the exported model to ONNX directly (`torch.onnx.export`; both the dynamo and the TorchScript exporters are tested). The onnxruntime output matches PyTorch. See `tests/test_onnx.py`.
+### `analyze` and `ChannelGraph`
 
-### `analyze` and `ChannelGraph`: inspect or set the channel structure by hand
-
-`analyze()` does not build a model. It only returns the analysis result, so you can first check which parts will be augmented:
+`analyze()` only returns the channel analysis result. When `torch.fx` cannot trace the model (`TraceError`), you can build a `ChannelGraph` by hand and pass it to `NetAugModel(graph=...)`. When you set it by hand, the two sides of a residual must use the same group index. For the definition of `LayerRole`, see [design.en.md Section 2](docs/design.en.md#2-channel-groups).
 
 ```python
-from torchnetaug import analyze
+from torchnetaug import analyze, ChannelGraph, LayerRole
 
 graph = analyze(tiny, example)
 print(len(graph.free_groups()), "/", graph.num_groups, "groups can be augmented")
-```
-
-When `torch.fx` cannot trace the model (`TraceError`), you can build a `ChannelGraph` by hand and pass it to `NetAugModel(graph=...)`:
-
-```python
-from torchnetaug import ChannelGraph, LayerRole
 
 net = nn.Sequential(
     nn.Conv2d(3, 8, 3, padding=1), nn.BatchNorm2d(8), nn.ReLU(),
@@ -360,22 +295,13 @@ wrapped = NetAugModel(net, graph=manual, width_mults=(1.0, 2.0))
 print(wrapped.max_sizes)   # [3, 16, 32, 10]
 ```
 
-The `kind` of `LayerRole`:
-
-- `"dense"`: `nn.Conv2d` (`groups=1`) or `nn.Linear`. The output channels are `out_group`. The input channels belong to `in_groups` in order (more than one with concat).
-- `"member"`: BatchNorm or a depthwise conv. The input equals the output, and both belong to `in_groups`.
-
-When you set the structure by hand, the two sides of a residual addition must use the same group index. Otherwise, sorting and width switching both go wrong.
-
 ## Supported scope
 
-Augmented: `nn.Conv2d` (normal and depthwise), `nn.Linear`, BatchNorm, and the common operations between them (activation functions, pooling, residual addition, SE multiplication, concat, flatten).
-
-Not augmented (the related channels keep their original width, but the model is still correct): grouped convolution, GroupNorm/LayerNorm, channel shuffle, layer scale parameters, `Conv1d`/`Conv3d`, and others. For the full list, see [docs/design.en.md Section 2.2](docs/design.en.md#22-whitelist-analysis).
-
-The max-width model has about `max(width_mults)²` times the parameters of the base. For example, `width_mults=(1.0, 2.0, 3.0)` gives about 9 times. Depth augmentation adds the parameters of the extra blocks.
-
-Depth augmentation works only on blocks that "keep the input shape and run only once per forward". It also needs `torch.fx` tracing (it cannot be used together with a manual `graph=`).
+| Item | Description |
+|---|---|
+| Augmented | `nn.Conv2d` (normal and depthwise), `nn.Linear`, BatchNorm, and the common operations between them |
+| Not augmented | Grouped convolution, GroupNorm/LayerNorm, channel shuffle, `Conv1d`/`Conv3d`, and others. The related channels keep their original width, and the model is still correct (for the full list, see [design.en.md Section 2.2](docs/design.en.md#22-whitelist-analysis)) |
+| Memory | The max-width network has about `max(width_mults)²` times the parameters of the base model, for example about 9 times for `(1.0, 2.0, 3.0)` |
 
 ## Tests
 
@@ -383,15 +309,11 @@ Depth augmentation works only on blocks that "keep the input shape and run only 
 uv run pytest
 ```
 
-The 471 tests compare against plain PyTorch models built without this package. They check base mode, every width, the gradient of one step (Eq. 2 of the paper), sorting, and export. See [docs/design.en.md Section 9](docs/design.en.md#9-correctness-verification).
-
-## Experiment findings
-
-On CIFAR-10 and CIFAR-100 (TinyResNet, 40 epochs), NetAug did not significantly improve the test accuracy of the base model. A baseline trained for 40 more epochs (2 times the compute, still less than the about 2.6 times of NetAug in this environment) gave a significant gain of +1.54 percentage points. For the results, observations, and commands to reproduce them, see [docs/experiments.en.md](docs/experiments.en.md). For the project summary and future work, see [summary.en.md](summary.en.md).
+The 471 tests compare against plain PyTorch models. They check base mode, every width, the gradient of one step (Eq. 2 of the paper), sorting and export. See [design.en.md Section 9](docs/design.en.md#9-correctness-verification).
 
 ## Citation and references
 
-The method in this package comes from the paper below. If you use torchnetaug in your research, please cite the original paper:
+If you use torchnetaug in your research, please cite the original paper:
 
 ```bibtex
 @inproceedings{cai2022network,
@@ -403,14 +325,11 @@ The method in this package comes from the paper below. If you use torchnetaug in
 }
 ```
 
-- Paper: <https://arxiv.org/abs/2110.08890>. A local copy is in [docs/reference/papers/](docs/reference/papers/). For its license, see the notes in that folder.
-- Official implementation: <https://github.com/mit-han-lab/tinyml/tree/master/netaug> (MIT license). This package follows its design (weight slicing, sampling only one augmented network, BN reset, export), but the code is written independently. No official code is copied.
-- Summary of the paper and the official implementation (checked against the original PDF): [docs/reference/netaug_paper.md](docs/reference/netaug_paper.md)
-- Analysis of the project author's earlier implementation on YOLOv8: [docs/reference/netaug_reference_impl.md](docs/reference/netaug_reference_impl.md). The source code is not in this repo.
-- Experiment dataset CIFAR-10: Alex Krizhevsky. *Learning Multiple Layers of Features from Tiny Images*. Technical report, University of Toronto, 2009.
+- Paper: <https://arxiv.org/abs/2110.08890>. A local copy is in [docs/reference/papers/](docs/reference/papers/).
+- Official implementation: <https://github.com/mit-han-lab/tinyml/tree/master/netaug> (MIT license). This package follows its design, but the code is written independently.
+- Summary of the paper and the official implementation: [docs/reference/netaug_paper.md](docs/reference/netaug_paper.md).
+- CIFAR-10: Alex Krizhevsky. *Learning Multiple Layers of Features from Tiny Images*. Technical report, University of Toronto, 2009.
 
 ## License
 
-The code is under the MIT license. See [LICENSE](LICENSE).
-
-Exception: the paper PDFs in [docs/reference/papers/](docs/reference/papers/) belong to their original authors and are under the CC BY-NC-SA 4.0 license. The MIT license does not apply to them, and they are not packaged.
+The code is under the MIT license. See [LICENSE](LICENSE). The paper PDFs in [docs/reference/papers/](docs/reference/papers/) belong to their original authors and are under the CC BY-NC-SA 4.0 license. They are not included in the package.

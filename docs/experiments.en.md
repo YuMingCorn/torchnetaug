@@ -2,26 +2,31 @@
 
 [繁體中文](experiments.md) | **English**
 
-Dates: 2026-11-19 (CIFAR-10), 2026-11-23 (CIFAR-100). For the code design and correctness verification, see [design.en.md](design.en.md). For the project summary, see [summary.en.md](../summary.en.md). For terms, see [glossary.md](glossary.md).
+Dates: 2026-11-19 (CIFAR-10), 2026-11-23–24 (CIFAR-100). For the code design and correctness verification, see [design.en.md](design.en.md). For the project summary, see [summary.en.md](../summary.en.md). For terms, see [glossary.md](glossary.md).
 
-## 1. Conclusions
+## 1. Key points
 
-- **In every tested setting, NetAug did not significantly improve the test accuracy of the base model.** On CIFAR-10 the gain is at most +0.34 percentage points, smaller than the seed noise. On CIFAR-100, no NetAug setting has a 95% confidence interval with a lower bound above 0.
-- **A baseline trained for 40 more epochs (about 2 times the compute, still less than the 2.6 times of NetAug in this environment) gains +1.54 percentage points (95% CI [+0.85, +2.24]), and this gain is significant.**
-- The training accuracy often goes up (+0.7 to +1.3 percentage points per seed on CIFAR-10), but this does not turn into test accuracy.
-- Depth augmentation, channel sorting, and the recipe options of the official code did not change the result.
-- Wide models exported from a NetAug model are 1.3 to 20 percentage points below models of the same width trained alone.
-- MobileNetV2 (1 seed) trains worse with NetAug. The cause is not known.
-- No implementation error that could make NetAug fail was found. For all exported models, the output difference from the dynamic network is 0.
+1. **NetAug did not significantly improve the test accuracy of the base model.** On CIFAR-10 the gain is at most +0.34 percentage points, smaller than the seed noise. On CIFAR-100 (8 seeds per setting), no NetAug setting has a 95% confidence interval with a lower bound above 0.
+2. **A baseline trained for 40 more epochs gives a significant gain**: +1.54 percentage points (95% CI [+0.85, +2.24]). It uses about 2 times the compute, still less than the 2.6 times of NetAug in this environment.
+3. **The training accuracy goes up, but the test accuracy does not** (+0.7 to +1.3 percentage points per seed on CIFAR-10; +1.16 percentage points on average at CIFAR-100 ×1). Depth augmentation, channel sorting and the recipe options of the official implementation did not change the result.
+4. **Exported wide models are 1.3 to 20.5 percentage points below models of the same width trained alone.** MobileNetV2 (1 seed) is worse with NetAug. The cause is not known.
+5. **No implementation error was found.** For all exported models, the output difference from the dynamic model is 0.
+
+```mermaid
+flowchart LR
+    Q["Why does NetAug not help?"] --> A["Unsuitable setup?<br/>→ Sections 4.1, 4.2: no gain even in an underfitting setup"]
+    Q --> B["Implementation error?<br/>→ Tests and Sections 4.3–4.5: no error found"]
+    Q --> C["Method does not work in this scope?<br/>→ Section 4.7: possible, not proven"]
+```
 
 ## 2. Common setup
 
 | Item | Setting |
 |---|---|
 | Code | Branch `feat/torchnetaug`: CIFAR-10 width `941b37a`, depth `83e5073`, CIFAR-100 `f81bdfc` |
-| Environment | Python 3.14.3, PyTorch 2.11.0+cu128, Windows 10, RTX 3060 Ti 8 GB |
+| Environment | Python 3.14.3, PyTorch 2.11.0+cu128, Windows 10, RTX 3060 Ti 8 GB (bf16); Colab Tesla T4 15 GB (second batch completing 8 seeds on CIFAR-100, fp16) |
 | Model | TinyResNet: CIFAR ResNet-18 at 1/8 width (8, 16, 32, 64 channels, 176,402 parameters); `--width` multiplies this by a base width multiplier |
-| Training | 40 epochs, batch 128, Nesterov SGD (momentum 0.9), lr 0.1 cosine, weight decay 5e-4 (not on BN and bias), random crop and horizontal flip, bf16 autocast |
+| Training | 40 epochs, batch 128, Nesterov SGD (momentum 0.9), lr 0.1 cosine, weight decay 5e-4 (not on BN and bias), random crop and horizontal flip, 16-bit autocast (bf16 on 3060 Ti, fp16 on T4) |
 | NetAug | `width_mults=(1.0, 2.0, 3.0)`, `alpha=1.0`, each channel group samples its own width, augmentation for the whole run |
 | Evaluation | Before evaluation, the BN statistics of each model are re-estimated on 10,000 training images (no data augmentation). Test accuracy uses the 10,000 test images; training accuracy uses the first 10,000 training images |
 | Comparison | Runs with the same seed have the same base initialization and data order, so each run is paired with the baseline of the same seed and subtracted |
@@ -90,21 +95,22 @@ The effect on CIFAR-10 is small. This section checks why: the setup does not sui
 |---|---|---|---|---|---|
 | ×0.25 baseline | 8 | 32.54 | — | — | — |
 | ×0.25 NetAug | 8 | 32.41 | −0.14 [−0.76, +0.49] | +0.08 [−0.43, +0.58] | No real gain |
-| ×0.25 NetAug, initialize the whole max-width network (`--init max`) | 5 | 32.72 | +0.32 [−1.11, +1.74] | +0.04 [−1.24, +1.32] | Inconclusive |
-| ×0.25 NetAug, stop augmentation for the second half (`--stop-aug 0.5`) | 5 | 32.59 | +0.18 [−0.65, +1.00] | +0.16 [−0.38, +0.69] | Inconclusive |
-| ×0.25 NetAug, sort every epoch + `--init max` | 5 | 32.16 | −0.25 [−1.44, +0.94] | −0.38 [−2.11, +1.35] | Inconclusive |
-| ×0.25 NetAug, weight decay 5e-5 (against the baseline with the same weight decay) | 5 | 30.81 | −0.22 [−2.34, +1.89] | −0.22 [−2.50, +2.07] | Inconclusive |
-| ×0.5 NetAug | 5 | 47.31 | +0.59 [−1.19, +2.36] | +0.66 [−0.95, +2.27] | Inconclusive |
-| ×1 NetAug | 5 | 59.52 | −0.46 [−1.05, +0.14] | +0.89 [−0.40, +2.18] | No real gain |
+| ×0.25 NetAug, initialize the whole max-width network (`--init max`) | 8 | 32.61 | +0.07 [−0.73, +0.87] | −0.17 [−1.00, +0.65] | Inconclusive |
+| ×0.25 NetAug, stop augmentation for the second half (`--stop-aug 0.5`) | 8 | 32.22 | −0.33 [−1.06, +0.40] | −0.27 [−0.87, +0.32] | No real gain |
+| ×0.25 NetAug, sort every epoch + `--init max` | 8 | 32.09 | −0.46 [−1.23, +0.32] | −0.51 [−1.47, +0.46] | No real gain |
+| ×0.25 NetAug, sample ×1 or ×2 for the whole model (`x(1/2) global`) | 8 | 32.04 | −0.50 [−1.31, +0.31] | −0.61 [−1.45, +0.24] | No real gain |
+| ×0.25 NetAug, weight decay 5e-5 (against the baseline with the same weight decay) | 8 | 30.76 | −0.41 [−1.64, +0.82] | −0.28 [−1.52, +0.97] | Inconclusive |
+| ×0.5 NetAug | 8 | 47.50 | +0.46 [−0.61, +1.52] | +0.67 [−0.24, +1.58] | Inconclusive |
+| ×1 NetAug | 8 | 59.53 | −0.10 [−0.90, +0.69] | +1.16 [+0.00, +2.32] | Inconclusive |
 | Control: ×0.25 baseline, lr 0.2, weight decay 2.5e-4 | 8 | 32.48 | −0.06 [−1.17, +1.04] | +0.02 [−1.34, +1.38] | Inconclusive |
-| Control: ×0.25 baseline, weight decay 5e-5 | 5 | 31.03 | −1.38 [−2.78, +0.03] | −1.64 [−3.04, −0.24] | No real gain |
+| Control: ×0.25 baseline, weight decay 5e-5 | 8 | 31.17 | −1.37 [−2.19, −0.55] | −1.60 [−2.47, −0.74] | No real gain |
 | Control: ×0.25 baseline, 80 epochs | 8 | 34.09 | **+1.54 [+0.85, +2.24]** | +1.58 [+0.97, +2.19] | Gain |
 
 ![Paired differences](figures/paired_diff.png)
 
-- No NetAug setting gives a test gain. The upper bound at ×0.25, +0.49, is only 0.01 below the threshold, so "no real gain" only just holds.
+- No NetAug setting gives a test gain. At ×0.25, default NetAug, stopping augmentation for the second half, sorting every epoch and sampling ×1/×2 for the whole model all read as "no real gain" (for default NetAug the upper bound, +0.49, is 0.01 below the threshold).
 - 40 more epochs of training give a significant gain. In this environment one NetAug step takes about 2.6 times the baseline step (the paper reports +16.7%), so this compute comparison applies only to this environment.
-- The difference in training accuracy grows with the base width (×0.25 +0.08, ×0.5 +0.66, ×1 +0.89), but all three intervals contain 0. At ×1 the training accuracy goes up and the test accuracy goes down, the same as ResNet50 in the paper.
+- The difference in training accuracy grows with the base width (×0.25 +0.08, ×0.5 +0.67, ×1 +1.16). At ×1 the 95% confidence interval lies above 0, yet the test accuracy still shows no gain (−0.10), the same as ResNet50 in the paper.
 - The paper says smaller models gain more. Here the most underfitting model, ×0.25, gains the least.
 
 ### 4.3 Exported wide models
@@ -115,12 +121,12 @@ The effect on CIFAR-10 is small. This section checks why: the setup does not sui
 
 | Base width | Exported ×2 | Exported ×3 | Same width trained alone |
 |---|---|---|---|
-| ×0.25 | 39.04 | 40.47 | 46.72 (×2), 55.13 (×3) |
-| ×0.25, stop augmentation 0.5 | 34.61 | 35.02 | Same as above |
-| ×0.5 | 52.28 | 53.06 | 59.98 (×2) |
+| ×0.25 | 39.04 | 40.47 | 47.04 (×2), 55.25 (×3) |
+| ×0.25, stop augmentation 0.5 | 34.33 | 34.73 | Same as above |
+| ×0.5 | 52.61 | 53.43 | 59.64 (×2) |
 
-- The exported wide models are 7.7 to 20.1 percentage points below models of the same width trained alone. When each group samples its own width, the whole ×3 network is almost never sampled. The networks actually sampled in training (19,000 to 92,000 parameters) give 36.97 ± 2.41% on average after export, while a 47,600-parameter model trained alone gives 46.7%.
-- **Wide-path check**: when the whole network samples ×1 or ×2 together, the exported ×2 gives 41.22 ± 1.56% (n=3). The ×2 network is trained in only about half of the steps, and the after-the-fact control, a ×2 model trained alone for 20 epochs, gives 43.2% (n=3), about 2 percentage points higher. This control was not designed in advance, so the reading is "inconclusive": no clear defect was seen, but the check does not prove that the wide path has no problem.
+- The exported wide models are 7.0 to 20.5 percentage points below models of the same width trained alone. When each group samples its own width, the whole ×3 network is almost never sampled. The networks actually sampled in training (19,000 to 92,000 parameters) give 36.97 ± 2.41% on average after export, while a 47,600-parameter model trained alone gives 47.04%.
+- **Wide-path check**: when the whole network samples ×1 or ×2 together, the exported ×2 gives 41.39 ± 1.19% (n=8). The ×2 network is trained in only about half of the steps, and the after-the-fact control, a ×2 model trained alone for 20 epochs, gives 43.23 ± 0.90% (n=8), 1.84 percentage points higher. This control was not designed in advance, so the reading is "inconclusive": no clear defect was seen, but the check does not prove that the wide path has no problem.
 
 ### 4.4 Gradients
 
@@ -154,9 +160,9 @@ The gains of the paper come from MobileNet-class models on ImageNet, where augme
 
 ## 5. Limitations
 
-- CIFAR-10 has only 3 seeds per setting; CIFAR-100 has 3 to 8 seeds per setting; MobileNetV2 has only 1 seed. Differences smaller than about 0.5 percentage points cannot be told apart from seed noise.
+- CIFAR-10 has only 3 seeds per setting; CIFAR-100 has 8 seeds per setting; MobileNetV2 has only 1 seed. Differences smaller than about 0.5 percentage points cannot be told apart from seed noise.
 - Only 40 epochs (80 for a control), 32×32 images and two architectures were used. ImageNet was not tested.
-- During some runs the GPU was also running other programs, so the run times are only approximate.
+- During some runs the GPU was also running other programs, and the second batch ran in fp16 on a Colab Tesla T4, so the run times are only approximate.
 
 ## 6. Reproduction
 
@@ -168,11 +174,9 @@ bash examples/run_cifar10_compare.sh                   # Section 3.1
 bash examples/run_cifar10_depth.sh                     # Section 3.3
 uv run python examples/summarize.py runs/cifar10_compare.jsonl runs/cifar10_depth.jsonl
 
-STAGES="main controls alone ablations" bash examples/run_diagnosis.sh   # Section 4
-SEEDS="0 1 2 3 4" STAGES="dose" bash examples/run_diagnosis.sh
-STAGES="sanity recipe" bash examples/run_diagnosis.sh
+bash examples/run_diagnosis.sh                         # Section 4 (all 7 stages, 8 seeds each)
 uv run python examples/summarize.py --ref-epochs 40 runs/diag/method_*.jsonl
-uv run python examples/plot_results.py --out runs/plots runs/diag/method_*.jsonl
+uv run python examples/plot_results.py --out runs/plots --ref-epochs 40 runs/diag/method_*.jsonl
 ```
 
 - The stages of `run_diagnosis.sh`: `main` (8 seeds), `dose` (base width 0.5, 1.0), `controls`, `alone`, `ablations`, `sanity`, `recipe`. Finished runs are skipped.

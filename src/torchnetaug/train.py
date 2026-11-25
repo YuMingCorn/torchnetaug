@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import random
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import Any
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from .layers import DynamicBatchNorm
 from .netaug import NetAugModel
@@ -21,11 +22,11 @@ def netaug_step(
     criterion: Callable[[Any, Any], torch.Tensor],
     alpha: float = 1.0,
     augment: bool = True,
-    generator: Optional[random.Random] = None,
+    generator: random.Random | None = None,
     granularity: str = "group",
     backward: Callable[[torch.Tensor], None] = lambda loss: loss.backward(),
-    forward: Optional[Callable[[nn.Module, Any], Any]] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    forward: Callable[[nn.Module, Any], Any] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the forward/backward passes of one NetAug step (the optimizer step is yours).
 
     The objective is ``L(base) + alpha * L(augmented)`` with one sampled augmented model,
@@ -41,7 +42,8 @@ def netaug_step(
     Returns ``(base_loss, aug_loss)`` detached; ``aug_loss`` is None if ``augment`` is False.
     """
     fwd = forward or (lambda m, x: m(x))
-    unwrapped = model.module if hasattr(model, "module") else model  # DDP / DataParallel
+    inner = getattr(model, "module", model)  # DDP / DataParallel
+    unwrapped = inner if isinstance(inner, NetAugModel) else model
 
     unwrapped.set_base()
     base_loss = criterion(fwd(model, inputs), targets)
@@ -61,10 +63,10 @@ def netaug_step(
 def recalibrate_bn(
     model: nn.Module,
     batches: Iterable[Any],
-    num_batches: Optional[int] = None,
-    forward: Optional[Callable[[nn.Module, Any], Any]] = None,
-    sizes: Optional[Sequence[int]] = None,
-    depths: Optional[Mapping[str, int]] = None,
+    num_batches: int | None = None,
+    forward: Callable[[nn.Module, Any], Any] | None = None,
+    sizes: Sequence[int] | None = None,
+    depths: Mapping[str, int] | None = None,
 ) -> None:
     """Re-estimate batch-norm running statistics with exact averages over ``batches``.
 
@@ -79,8 +81,10 @@ def recalibrate_bn(
     Each item of ``batches`` is passed to ``forward``; by default a ``(inputs, targets)``
     pair or a bare tensor is accepted.
     """
-    netaug = model.module if hasattr(model, "module") else model
+    inner = getattr(model, "module", model)
+    netaug = inner if isinstance(inner, NetAugModel) else None
     if forward is None:
+
         def forward(m: nn.Module, batch: Any) -> Any:
             x = batch[0] if isinstance(batch, (list, tuple)) else batch
             return m(x)
@@ -90,24 +94,26 @@ def recalibrate_bn(
         return
     saved = [(m, m.momentum) for m in bns]
     flags = [(m, m.training) for m in model.modules()]  # keep per-module flags (frozen BN, ...)
-    previous = netaug.state() if isinstance(netaug, NetAugModel) else None
+    previous = netaug.state() if netaug is not None else None
     try:
-        if previous is not None:
+        if netaug is not None and previous is not None:
             netaug.set_base()
             if sizes is not None or depths is not None:
-                netaug.set_state((
-                    netaug.base_sizes if sizes is None else sizes,
-                    {**netaug.base_depths, **(depths or {})},
-                    "custom",
-                ))
+                netaug.set_state(
+                    (
+                        netaug.base_sizes if sizes is None else sizes,
+                        {**netaug.base_depths, **(depths or {})},
+                        "custom",
+                    )
+                )
             for m in bns:
                 if isinstance(m, DynamicBatchNorm):
                     m.update_stats = True  # set_sizes() turns it off outside base mode
         idle = set()  # BNs of extra blocks that do not run keep their statistics
-        if previous is not None:
+        if netaug is not None and previous is not None:
             for path in netaug._depth_paths:
-                stack = netaug.model.get_submodule(path)
-                for extra in stack.extra[stack.active:]:
+                stack = netaug._stack(path)
+                for extra in stack.extra[stack.active :]:
                     idle.update(id(m) for m in extra.modules())
         for m in bns:
             if m.track_running_stats and id(m) not in idle:
@@ -123,5 +129,5 @@ def recalibrate_bn(
             m.momentum = momentum
         for m, flag in flags:
             m.training = flag
-        if previous is not None:
+        if netaug is not None and previous is not None:
             netaug.set_state(previous)

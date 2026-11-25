@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import itertools
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
-import torch.nn as nn
 from conftest import example_input, randomize
+from torch import nn
 
 from torchnetaug import DynamicBatchNorm, DynamicConv2d, DynamicLinear, NetAugModel
 
@@ -30,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _load_experiment():
     spec = importlib.util.spec_from_file_location("cifar_netaug", ROOT / "examples" / "cifar_netaug.py")
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -60,6 +63,7 @@ def test_dense_conv_equals_plain_conv(segments, out):
     dyn.active_out = out
     idx = torch.tensor(_index(segments))
     plain = nn.Conv2d(len(idx), out, 3, padding=1, bias=True)
+    assert plain.bias is not None and dyn.bias is not None
     with torch.no_grad():
         plain.weight.copy_(dyn.weight[:out][:, idx])
         plain.bias.copy_(dyn.bias[:out])
@@ -76,6 +80,7 @@ def test_depthwise_conv_equals_plain_conv(segments):
     idx = torch.tensor(_index(segments))
     n = len(idx)
     plain = nn.Conv2d(n, n, 3, padding=1, groups=n, bias=True)
+    assert plain.bias is not None and dyn.bias is not None
     with torch.no_grad():
         plain.weight.copy_(dyn.weight[idx])
         plain.bias.copy_(dyn.bias[idx])
@@ -110,6 +115,8 @@ def test_batchnorm_equals_plain_batchnorm(segments, momentum):
     idx = torch.tensor(_index(segments))
     n = len(idx)
     plain = nn.BatchNorm2d(n, momentum=momentum)
+    assert dyn.running_mean is not None and dyn.running_var is not None and dyn.num_batches_tracked is not None
+    assert plain.running_mean is not None and plain.running_var is not None
     with torch.no_grad():
         for attr in ("weight", "bias", "running_mean", "running_var"):
             getattr(plain, attr).copy_(getattr(dyn, attr)[idx])
@@ -227,7 +234,7 @@ def test_tiny_resnet_parameter_counts():
         netaug.set_width(m)
         counts[m] = netaug.num_active_params()
     assert counts[1.0] == 176_402
-    assert all(counts[a] < counts[b] for a, b in zip(MULTS, MULTS[1:]))
+    assert all(counts[a] < counts[b] for a, b in itertools.pairwise(MULTS))
     netaug.set_base()
     assert counts[1.0] == sum(p.numel() for p in netaug.export().parameters())
 
@@ -243,9 +250,17 @@ def _materialize(netaug: NetAugModel) -> nn.Module:
         n = len(idx)
         if isinstance(layer, DynamicConv2d):
             out = n if layer.depthwise else layer.active_out
-            new = nn.Conv2d(n, out, layer.kernel_size, layer.stride, layer.padding, layer.dilation,
-                            groups=n if layer.depthwise else 1, bias=layer.bias is not None,
-                            padding_mode=layer.padding_mode)
+            new: nn.Module = nn.Conv2d(
+                n,
+                out,
+                cast(Any, layer.kernel_size),
+                cast(Any, layer.stride),
+                cast(Any, layer.padding),
+                cast(Any, layer.dilation),
+                groups=n if layer.depthwise else 1,
+                bias=layer.bias is not None,
+                padding_mode=layer.padding_mode,
+            )
             w = layer.weight[idx] if layer.depthwise else layer.weight[:out][:, idx]
             b = None if layer.bias is None else (layer.bias[idx] if layer.depthwise else layer.bias[:out])
         elif isinstance(layer, DynamicLinear):
@@ -253,16 +268,24 @@ def _materialize(netaug: NetAugModel) -> nn.Module:
             w = layer.weight[: layer.active_out][:, idx]
             b = None if layer.bias is None else layer.bias[: layer.active_out]
         else:
-            new = nn.BatchNorm2d(n, eps=layer.eps, momentum=layer.momentum, affine=layer.affine)
+            assert isinstance(layer, DynamicBatchNorm)
+            new_bn = nn.BatchNorm2d(n, eps=layer.eps, momentum=layer.momentum, affine=layer.affine)
             w = None if layer.weight is None else layer.weight[idx]
             b = None if layer.bias is None else layer.bias[idx]
+            assert (
+                new_bn.running_mean is not None
+                and new_bn.running_var is not None
+                and layer.running_mean is not None
+                and layer.running_var is not None
+            )
             with torch.no_grad():
-                new.running_mean.copy_(layer.running_mean[idx])
-                new.running_var.copy_(layer.running_var[idx])
+                new_bn.running_mean.copy_(layer.running_mean[idx])
+                new_bn.running_var.copy_(layer.running_var[idx])
+            new = new_bn
         with torch.no_grad():
-            if w is not None:
+            if w is not None and isinstance(new.weight, torch.Tensor):
                 new.weight.copy_(w)
-            if b is not None:
+            if b is not None and isinstance(new.bias, torch.Tensor):
                 new.bias.copy_(b)
         parent, _, child = name.rpartition(".")
         setattr(plain.get_submodule(parent) if parent else plain, child, new)
@@ -308,7 +331,9 @@ def test_tiny_resnet_export_at_width_equals_standalone(tiny, mult):
         out.train(train), ref.train(train)
         torch.testing.assert_close(out(x), ref(x))
     # BN statistics of the exported model update like the standalone model
-    torch.testing.assert_close(out.stem[1].running_mean, ref.stem[1].running_mean)
+    out_any: Any = out
+    ref_any: Any = ref
+    torch.testing.assert_close(out_any.stem[1].running_mean, ref_any.stem[1].running_mean)
 
 
 @pytest.mark.parametrize("model_name", ["conv_chain", "tiny_dense", "resnet18", "mobilenet_v2", "efficientnet_b0"])

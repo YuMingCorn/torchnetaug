@@ -13,7 +13,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ["README.md", "README.en.md", "docs/design.md", "docs/design.en.md"]
-BLOCK = re.compile(r"^```python\n(.*?)^```", re.S | re.M)
+BLOCK = re.compile(r"^```python\n(.*?)^```", re.DOTALL | re.MULTILINE)
 
 
 def blocks(path: Path):
@@ -31,8 +31,8 @@ def test_doc_examples_run(doc):
         namespace = {"__name__": "__doc_example__"}
         for i, src in enumerate(runnable):
             try:
-                exec(compile(src, f"{doc}[block {i}]", "exec"), namespace)
-            except Exception as e:  # noqa: BLE001
+                exec(compile(src, f"{doc}[block {i}]", "exec"), namespace)  # noqa: S102
+            except Exception as e:
                 raise AssertionError(f"{doc} block {i} failed:\n{src}\n{type(e).__name__}: {e}") from e
     finally:
         torch.set_default_dtype(previous)

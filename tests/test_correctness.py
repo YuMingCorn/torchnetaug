@@ -2,17 +2,23 @@
 
 import copy
 import random
+from typing import Any
 
 import pytest
 import torch
-import torch.nn as nn
 import torchvision
-
-from torchnetaug import DynamicBatchNorm, DynamicConv2d, DynamicLinear, NetAugModel, netaug_step, recalibrate_bn
-
 from conftest import assert_sorted, build, example_input, randomize
+from torch import nn
+
+from torchnetaug import DynamicConv2d, DynamicLinear, NetAugModel, netaug_step, recalibrate_bn
 
 ATOL = 1e-9
+
+
+def _out_fixed(aug: NetAugModel, layer: str) -> bool:
+    g = aug.graph.layers[layer].out_group
+    assert g is not None
+    return aug.graph.group_fixed[g]
 
 
 def wrap(name, mults=(1.0, 2.0, 3.0), **kw):
@@ -47,9 +53,7 @@ def test_export_equals_base(model_name):
     aug.eval()
     exported = aug.export().eval()
     assert type(exported) is type(base)
-    assert {k: v.shape for k, v in exported.state_dict().items()} == {
-        k: v.shape for k, v in base.state_dict().items()
-    }
+    assert {k: v.shape for k, v in exported.state_dict().items()} == {k: v.shape for k, v in base.state_dict().items()}
     with aug.mode_ctx("base"):
         torch.testing.assert_close(exported(x), aug(x), atol=ATOL, rtol=0)
 
@@ -141,7 +145,7 @@ def test_permutation_commutes_with_optimizer_step(opt_name):
 
 
 def test_sort_with_extra_model_keeps_ema_aligned():
-    _, aug, x = wrap("resnet18")
+    _, aug, _ = wrap("resnet18")
     randomize(aug, seed=8)
     ema = copy.deepcopy(aug)
     aug.sort_channels(extra_models=[ema])
@@ -262,7 +266,7 @@ def test_netaug_step_gradient_is_paper_eq2(model_name, seed):
 def test_recalibrate_bn_matches_exported_model():
     from torch.optim.swa_utils import update_bn
 
-    _, aug, x = wrap("mobilenet_v2")
+    _, aug, _ = wrap("mobilenet_v2")
     aug.set_max()  # recalibrate must switch to base by itself
     batches = [example_input(4, seed=s) for s in range(3)]
     recalibrate_bn(aug, batches)
@@ -279,11 +283,9 @@ def test_fixed_groups_for_unknown_ops():
     _, aug, _ = wrap("group_norm")
     roles = aug.graph.layers
     assert "gn" not in roles  # GroupNorm is not whitelisted
-    c1_group = roles["c1"].out_group
-    c2_group = roles["c2"].out_group
-    assert aug.graph.group_fixed[c1_group]  # read by GroupNorm
-    assert aug.graph.group_fixed[c2_group]  # multiplied by a channel-wise parameter
-    assert not aug.graph.group_fixed[roles["c3"].out_group]
+    assert _out_fixed(aug, "c1")  # read by GroupNorm
+    assert _out_fixed(aug, "c2")  # multiplied by a channel-wise parameter
+    assert not _out_fixed(aug, "c3")
 
 
 def test_resnet_stage_is_one_group():
@@ -292,8 +294,11 @@ def test_resnet_stage_is_one_group():
     roles = aug.graph.layers
     stage1 = {roles["conv1"].out_group, roles["layer1.0.conv2"].out_group, roles["layer1.1.conv2"].out_group}
     assert len(stage1) == 1
-    stage4 = {roles["layer4.0.conv2"].out_group, roles["layer4.0.downsample.0"].out_group,
-              roles["layer4.1.conv2"].out_group}
+    stage4 = {
+        roles["layer4.0.conv2"].out_group,
+        roles["layer4.0.downsample.0"].out_group,
+        roles["layer4.1.conv2"].out_group,
+    }
     assert len(stage4) == 1
     assert roles["fc"].in_groups == (roles["layer4.1.conv2"].out_group,)
     assert len(roles) == 1 + 16 + 3 + 1 + 20  # convs + fc + BNs
@@ -305,10 +310,9 @@ def test_mismatched_residual_layout_is_fixed():
     base = randomize(ConcatMismatch())
     x = example_input()
     aug = NetAugModel(base, x)
-    roles = aug.graph.layers
     for name in ("a", "b", "proj"):
-        assert aug.graph.group_fixed[roles[name].out_group]
-    assert not aug.graph.group_fixed[roles["c"].out_group]
+        assert _out_fixed(aug, name)
+    assert not _out_fixed(aug, "c")
     torch.testing.assert_close(aug(x), base(x), atol=ATOL, rtol=0)
 
 
@@ -334,7 +338,7 @@ def test_set_width():
 
 def test_recalibrate_bn_at_other_width():
     """Calibrating at max width must give each BN the exact mean of its max-width inputs."""
-    _, aug, x = wrap("conv_chain")
+    _, aug, _ = wrap("conv_chain")
     batches = [example_input(4, seed=s) for s in range(3)]
     bn = aug.model.features[1]
     seen = []
@@ -372,8 +376,7 @@ class SpatialAttention(nn.Module):
 def test_one_channel_broadcast_group_is_fixed():
     x = example_input()
     m = NetAugModel(randomize(SpatialAttention()), x)
-    g = m.graph.layers["att"].out_group
-    assert m.graph.group_fixed[g]
+    assert _out_fixed(m, "att")
     assert m.graph.layers["c1"].out_group in m.graph.free_groups()
     m.set_max()
     m(x)
@@ -410,6 +413,7 @@ def test_tied_weights_are_rejected():
 
 def test_binary_lower_rank_broadcast_is_fixed():
     """A lower-rank tracked tensor broadcast against spatial dims must stay fixed."""
+
     class LowerRank2D(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -440,8 +444,8 @@ def test_binary_lower_rank_broadcast_is_fixed():
     for cls, fixed_layer in ((LowerRank2D, "fc_bias"), (LowerRank3D, "c_side")):
         base = randomize(cls()).eval()
         aug = NetAugModel(base, x, width_mults=(1.0, 2.0)).eval()
-        assert aug.graph.group_fixed[aug.graph.layers[fixed_layer].out_group]
-        assert not aug.graph.group_fixed[aug.graph.layers["c1"].out_group]
+        assert _out_fixed(aug, fixed_layer)
+        assert not _out_fixed(aug, "c1")
         torch.testing.assert_close(aug(x), base(x), atol=ATOL, rtol=0)
         randomize(aug, seed=9)
         aug.set_max()
@@ -452,6 +456,7 @@ def test_binary_lower_rank_broadcast_is_fixed():
 
 def test_clamp_with_tensor_bounds_is_fixed():
     """torch.clamp with per-channel tensor/Parameter bounds must fix the touched groups."""
+
     class ClampParam(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -492,7 +497,7 @@ def test_clamp_with_tensor_bounds_is_fixed():
         base = randomize(cls()).eval()
         aug = NetAugModel(base, x, width_mults=(1.0, 2.0)).eval()
         for name in fixed_names:
-            assert aug.graph.group_fixed[aug.graph.layers[name].out_group]
+            assert _out_fixed(aug, name)
         torch.testing.assert_close(aug(x), base(x), atol=ATOL, rtol=0)
         randomize(aug, seed=9)
         aug.set_max()
@@ -501,11 +506,12 @@ def test_clamp_with_tensor_bounds_is_fixed():
         torch.testing.assert_close(aug(x), before, atol=1e-8, rtol=1e-8)
 
     aug_scalar = NetAugModel(randomize(ClampScalar()).eval(), x, width_mults=(1.0, 2.0)).eval()
-    assert not aug_scalar.graph.group_fixed[aug_scalar.graph.layers["c1"].out_group]
+    assert not _out_fixed(aug_scalar, "c1")
 
 
 def test_reshape_hardcoded_and_size1_squeeze_are_fixed():
     """Hardcoded channel sizes in view/reshape and squeezing/flattening dim 1 must fix C."""
+
     class HardcodedView(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -580,14 +586,14 @@ def test_reshape_hardcoded_and_size1_squeeze_are_fixed():
     ):
         base = randomize(cls()).eval()
         aug = NetAugModel(base, inp, width_mults=(1.0, 2.0)).eval()
-        assert aug.graph.group_fixed[aug.graph.layers["c1"].out_group], cls.__name__
+        assert _out_fixed(aug, "c1"), cls.__name__
         aug.set_max()
         torch.testing.assert_close(aug(inp), base(inp), atol=ATOL, rtol=0)
 
     dyn_base = randomize(DynamicViews()).eval()
     dyn_aug = NetAugModel(dyn_base, x2, width_mults=(1.0, 2.0)).eval()
-    assert not dyn_aug.graph.group_fixed[dyn_aug.graph.layers["c1"].out_group]
-    assert not dyn_aug.graph.group_fixed[dyn_aug.graph.layers["c2"].out_group]
+    assert not _out_fixed(dyn_aug, "c1")
+    assert not _out_fixed(dyn_aug, "c2")
     randomize(dyn_aug, seed=11)
     dyn_aug.set_max()
     before = dyn_aug(x2)
@@ -597,6 +603,7 @@ def test_reshape_hardcoded_and_size1_squeeze_are_fixed():
 
 def test_batchnorm_no_affine_no_stats():
     """BatchNorm(affine=False, track_running_stats=False) has no params or buffers."""
+
     class Net(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -610,7 +617,7 @@ def test_batchnorm_no_affine_no_stats():
     x = example_input(batch=4, size=8)
     base = randomize(Net())
     aug = NetAugModel(base, x, width_mults=(1.0, 2.0))
-    assert not aug.graph.group_fixed[aug.graph.layers["c1"].out_group]
+    assert not _out_fixed(aug, "c1")
     for train_mode in (False, True):
         base.train(train_mode), aug.train(train_mode)
         torch.testing.assert_close(aug(x), base(x), atol=ATOL, rtol=0)
@@ -629,6 +636,7 @@ def test_batchnorm_no_affine_no_stats():
 
 def test_sync_batchnorm_is_fixed():
     """SyncBatchNorm must not be silently replaced by local DynamicBatchNorm."""
+
     class Net(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -645,8 +653,8 @@ def test_sync_batchnorm_is_fixed():
     aug = NetAugModel(base, x, width_mults=(1.0, 2.0)).eval()
     assert "bn" not in aug.graph.layers
     assert isinstance(aug.model.bn, nn.SyncBatchNorm)
-    assert aug.graph.group_fixed[aug.graph.layers["c1"].out_group]
-    assert not aug.graph.group_fixed[aug.graph.layers["c2"].out_group]
+    assert _out_fixed(aug, "c1")
+    assert not _out_fixed(aug, "c2")
     torch.testing.assert_close(aug(x), base(x), atol=ATOL, rtol=0)
     aug.set_max()
     aug(x)
@@ -654,6 +662,7 @@ def test_sync_batchnorm_is_fixed():
 
 def test_export_sizes_keeps_float64_precision_under_float32_default():
     """export(sizes) must not truncate float64 weights through the default float32 dtype."""
+
     class Net(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -672,8 +681,9 @@ def test_export_sizes_keeps_float64_precision_under_float32_default():
         aug = NetAugModel(base, x, width_mults=(1.0, 2.0)).eval()
         randomize(aug, seed=3)
         aug.set_max()
-        exported = aug.export(aug.active_sizes).eval()
-        torch.testing.assert_close(exported.c1.weight, aug.model.c1.active_weight(), rtol=0, atol=0)
+        exported: Any = aug.export(aug.active_sizes).eval()
+        c1: Any = aug.model.c1
+        torch.testing.assert_close(exported.c1.weight, c1.active_weight(), rtol=0, atol=0)
         torch.testing.assert_close(exported(x), aug(x), rtol=0, atol=0)
     finally:
         torch.set_default_dtype(previous)
@@ -681,6 +691,7 @@ def test_export_sizes_keeps_float64_precision_under_float32_default():
 
 def test_export_preserves_per_module_training_and_requires_grad():
     """Both export() and export(sizes) must preserve frozen BN flags and requires_grad."""
+
     class Net(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -695,17 +706,19 @@ def test_export_preserves_per_module_training_and_requires_grad():
             return self.fc(torch.relu(self.bn2(self.c2(x))).mean((2, 3)))
 
     x = example_input(batch=2, size=8)
-    base = randomize(Net()).train()
+    base: Any = randomize(Net()).train()
     base.bn1.eval()
     base.c1.weight.requires_grad_(False)
     aug = NetAugModel(base, x, width_mults=(1.0, 2.0))
     # also freeze a parameter after wrapping
-    aug.model.c2.bias.requires_grad_(False)
+    c2: Any = aug.model.c2
+    c2.bias.requires_grad_(False)
 
     for exported in (aug.export(), aug.export(aug.max_sizes)):
-        assert not exported.bn1.training
-        assert exported.bn2.training
-        assert not exported.c1.weight.requires_grad
-        assert exported.c1.bias.requires_grad
-        assert not exported.c2.bias.requires_grad
-        assert exported.c2.weight.requires_grad
+        exp: Any = exported
+        assert not exp.bn1.training
+        assert exp.bn2.training
+        assert not exp.c1.weight.requires_grad
+        assert exp.c1.bias.requires_grad
+        assert not exp.c2.bias.requires_grad
+        assert exp.c2.weight.requires_grad
