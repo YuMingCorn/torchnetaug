@@ -43,6 +43,9 @@
 | 白名單 | whitelist | 已知逐通道獨立運算的操作 / operations known to act on each channel independently | |
 | 生產者 | producer | 輸出某群組的 dense 層 / the dense layer whose output is a group | 產生者 |
 | 讀取者 | reader | 讀取某群組的層 / a layer that reads a group | |
+| dense 層 | dense layer | `groups=1` 的 conv 或 linear；排列在這裡停下 / a conv with `groups=1` or a linear layer; a permutation stops here | |
+| member 層 | member layer | 輸入與輸出是同一群組的層，如 BN、depthwise conv / a layer whose input and output are the same group, such as BN or depthwise conv | 成員層 |
+| block | block | 由 `group_kinds()` 從模組階層判定、或由 `blocks=` 指定的模組 / a module found by `group_kinds()` from the module hierarchy, or given with `blocks=` | 區塊、模塊 |
 | 追蹤 | tracing | 用 `torch.fx` 記錄模型的運算圖 / record the model's operation graph with `torch.fx` | |
 
 ## 排序、BN 與匯出 / Sorting, BN and export
@@ -50,7 +53,12 @@
 | 中文 | English | 定義 / Definition | 避免 / Avoid |
 |---|---|---|---|
 | 通道排序 | channel sorting | 把重要的通道移到群組前段 / move important channels to the front of each group | |
-| 重要度 | importance | 讀取者權重的 L1 範數 / L1 norm of the readers' weights | |
+| 重要度 | importance | dense 讀取者權重的 L1 範數；沒有讀取者時用 dense 生產者 / L1 norm of the dense readers' weights; the dense producers when there is no reader | |
+| 有序 | ordered | 每個寬度的前 `k` 個通道都是重要度最高的 `k` 個 / for every width, the first `k` channels are the `k` most important ones | 已排好、排序完成 |
+| 群組類別 | group kind | `group_kinds()` 的分類：`fixed`、`depth-tied`、`inner`、`concat-segment`、`residual`、`closed` / the classes of `group_kinds()` | 群組種類、群組型別 |
+| 排序範圍 | sort scope | `sort_channels(scope=...)` 選擇要排序的群組 / the groups that `sort_channels(scope=...)` sorts | 排序區域 |
+| inner 群組 | inner group | 所有層都在同一個 block 內的群組 / a group whose layers are all inside one block | 內部群組 |
+| closed 群組 | closed group | 只有一個生產者、不跨 concat 段的群組 / a group with one producer that is not a concat segment | 封閉群組 |
 | 排列 | permutation | 通道的新順序 / a new order of the channels | |
 | 權重共用 | weight sharing | 所有寬度使用同一組權重 / all widths use the same weights | |
 | 綁定權重 | tied weights | 兩個層共用同一個參數張量 / two layers share one parameter tensor | |

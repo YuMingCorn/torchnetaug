@@ -6,7 +6,7 @@ Status: finished (2026-11-24).
 
 ## Key points
 
-1. **The implementation matches the paper.** 471 tests show that the package computes the values that the paper defines ([design.en.md Section 9](docs/design.en.md#9-correctness-verification)).
+1. **The implementation matches the paper.** 609 tests show that the package computes the values that the paper defines ([design.en.md Section 9](docs/design.en.md#9-correctness-verification)).
 2. **NetAug did not raise the test accuracy of the base model.** On CIFAR-10 (3 seeds) and CIFAR-100 (8 seeds), every setting is within noise, gives no real gain, or is inconclusive.
 3. **A baseline trained for 40 more epochs does better**: +1.54 percentage points, and the gain is significant. It still uses less compute than NetAug (in this environment, one NetAug step takes about 2.6 times as long as a baseline step).
 4. **The extra loss signal did not turn into generalization.** The training accuracy went up (+1.16 percentage points on average at CIFAR-100 ×1), but the test accuracy did not. The augmented gradient points mostly in the same direction as the base gradient (cosine 0.82 to 0.93), so NetAug here acts close to a larger step size. The control for this was inconclusive, so it is only a conjecture.

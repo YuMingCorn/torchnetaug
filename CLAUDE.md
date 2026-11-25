@@ -18,7 +18,7 @@
 
 ## 套件與驗證
 
-- 專案總結與未來工作：[summary.md](summary.md)；程式碼設計與正確性驗證：[docs/design.md](docs/design.md)；用法：[README.md](README.md)；實驗結果與觀察：[docs/experiments.md](docs/experiments.md)；術語對照：[docs/glossary.md](docs/glossary.md)。
+- 專案總結與未來工作：[summary.md](summary.md)；程式碼設計與正確性驗證：[docs/design.md](docs/design.md)；用法：[README.md](README.md)；實驗結果與觀察：[docs/experiments.md](docs/experiments.md)；術語對照：[docs/glossary.md](docs/glossary.md)；官方實作差異表：[docs/official_diff.md](docs/official_diff.md)。
 - 文件中英並列：中文是 `X.md`，英文是同目錄的 `X.en.md`，兩者開頭互相連結。改中文就要同步改英文。
 - 文件風格（2026-11-23 決定）：用語依 glossary 的「避免」欄，不用同義詞；每份文件以最多 5 點的「重點」開頭，清單不超過 5 點；流程用 Mermaid 圖。
 - `uv run pytest`：正確性測試，以及 `tests/test_docs.py`（`DOCS` 清單中每份文件的 python 區塊都必須能執行，含英文版）。改了 API 就要同步改文件。ONNX 測試需要開發依賴 onnx、onnxscript、onnxruntime，沒裝時會跳過。
