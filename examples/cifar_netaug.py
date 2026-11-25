@@ -25,6 +25,7 @@ import math
 import random
 import time
 from pathlib import Path
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -133,6 +134,9 @@ def run_key(r: dict) -> tuple:
         r.get("init", "base"),
         r.get("granularity", "group"),
         r.get("warmup", 0),
+        r.get("sort_scope", "all"),
+        r.get("sort_agg", "sum"),
+        r.get("sort_opt", "permute"),
     )
 
 
@@ -238,6 +242,28 @@ def main() -> None:
     p.add_argument("--stop-aug", type=float, default=0.0, help="fraction of final epochs trained without augmentation")
     p.add_argument("--sort-every", type=int, default=0, help="sort channels every N epochs (0 = never)")
     p.add_argument(
+        "--sort-scope",
+        default="all",
+        choices=["all", "closed", "inner"],
+        help="NetAug with --sort-every > 0 only: the groups to sort (every free group; inner and "
+        "closed groups; inner groups only; see NetAugModel.group_kinds)",
+    )
+    p.add_argument(
+        "--sort-agg",
+        default="sum",
+        choices=["sum", "mean", "single"],
+        help="NetAug with --sort-every > 0 only: how the readers' L1 importances are combined. "
+        "sum: the library default; mean: each reader's importance divided by its weight "
+        "elements per channel, then summed; single: only the first reader",
+    )
+    p.add_argument(
+        "--sort-opt",
+        default="permute",
+        choices=["permute", "keep", "rebuild"],
+        help="NetAug with --sort-every > 0 only: the optimizer state at a sort. permute: permuted "
+        "with the weights; keep: not changed (as the official code); rebuild: cleared",
+    )
+    p.add_argument(
         "--eval-widths",
         type=float,
         nargs="+",
@@ -290,6 +316,9 @@ def main() -> None:
     p.add_argument("--out", default="runs/cifar_results.jsonl")
     p.add_argument("--skip-existing", action="store_true", help="skip if --out already has this run")
     args = p.parse_args()
+    sorting = args.method == "netaug" and args.sort_every > 0
+    if not sorting:  # the sort flags have no effect: store the defaults
+        args.sort_scope, args.sort_agg, args.sort_opt = "all", "sum", "permute"
 
     key = run_key(
         {
@@ -310,6 +339,9 @@ def main() -> None:
             "init": args.init,
             "granularity": args.granularity,
             "warmup": args.warmup,
+            "sort_scope": args.sort_scope,
+            "sort_agg": args.sort_agg,
+            "sort_opt": args.sort_opt,
         }
     )
     if args.depth and (args.method != "netaug" or args.model != "resnet_tiny"):
@@ -385,6 +417,40 @@ def main() -> None:
 
     sort_log = []
 
+    def is_identity(perm: torch.Tensor) -> bool:
+        return torch.equal(perm, torch.arange(perm.numel(), device=perm.device))
+
+    def sort_groups(m: NetAugModel) -> set[int]:
+        if args.sort_scope == "all":
+            return set(m.graph.free_groups())
+        kinds = {"inner"} if args.sort_scope == "inner" else {"inner", "closed"}
+        return {g for g, info in m.group_kinds().items() if info.kind in kinds}
+
+    def sort_channels(m: NetAugModel) -> dict[int, torch.Tensor]:
+        """Sort with --sort-scope, --sort-agg and --sort-opt; returns the permutations."""
+        o = opt if args.sort_opt == "permute" else None
+        if args.sort_agg == "sum":
+            perms = m.sort_channels(optimizer=o, scope=args.sort_scope)
+        else:
+            groups = sort_groups(m)
+            perms = {}
+            for g, per in m.channel_importance(per_reader=True).items():
+                if g not in groups:
+                    continue
+                parts = []
+                for name, imp in per.items():
+                    w = cast(nn.Conv2d | nn.Linear, m.model.get_submodule(name)).weight
+                    dim = 1 if g in m.graph.layers[name].in_groups else 0  # 0: producer fallback
+                    parts.append(imp / (w.numel() // w.shape[dim]) if args.sort_agg == "mean" else imp)
+                if args.sort_agg == "single":
+                    parts = parts[:1]
+                imp = sum(parts[1:], parts[0]) if parts else torch.zeros(m.max_sizes[g], device=device)
+                perms[g] = imp.argsort(descending=True, stable=True)
+            m.apply_permutations(perms, o)
+        if args.sort_opt == "rebuild":
+            opt.state.clear()  # momentum starts again; lr schedule and param_groups unchanged
+        return perms
+
     @torch.no_grad()
     def sort_and_log(epoch: int) -> None:
         """Sort channels and record evidence that the sort (a) moved channels across the
@@ -397,7 +463,8 @@ def main() -> None:
         model.eval()
         with model.mode_ctx("max"):
             before = model(probe)
-        perms = model.sort_channels(optimizer=opt)
+        default = {g: imp.argsort(descending=True, stable=True) for g, imp in model.channel_importance().items()}
+        perms = sort_channels(model)
         with model.mode_ctx("max"):
             after = model(probe)
         model.train()
@@ -408,6 +475,13 @@ def main() -> None:
             "groups": len(perms),
             "base_channels": sum(model.base_sizes[g] for g in perms),
             "moved_into_base": moved,
+            # groups whose order this sort changed
+            "sorted_groups": sum(not is_identity(p) for p in perms.values()),
+            # groups whose permutation differs from the default sort (sum, all groups); a
+            # group outside the scope counts if the default sort would have moved it
+            "diff_from_default": sum(
+                not (is_identity(p) if g not in perms else torch.equal(perms[g], p)) for g, p in default.items()
+            ),
             "max_abs_diff": (after - before).abs().max().item(),
             "max_abs_logit": before.abs().max().item(),
         }
@@ -421,7 +495,7 @@ def main() -> None:
     t0 = time.time()
     for epoch in range(args.epochs):
         model.train()
-        if isinstance(model, NetAugModel) and args.sort_every and epoch and epoch % args.sort_every == 0:
+        if isinstance(model, NetAugModel) and sorting and epoch and epoch < aug_until and epoch % args.sort_every == 0:
             sort_and_log(epoch)
         perm = torch.randperm(xtr.shape[0], device=device, generator=gen)
         loss_sum = torch.zeros((), device=device)
@@ -531,6 +605,9 @@ def main() -> None:
         "init": args.init,
         "warmup": args.warmup,
         "granularity": args.granularity,
+        "sort_scope": args.sort_scope,
+        "sort_agg": args.sort_agg,
+        "sort_opt": args.sort_opt,
         "params": n_base,
         "test_acc": test_acc,
         "train_acc": train_acc,

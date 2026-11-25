@@ -3,23 +3,28 @@
 from __future__ import annotations
 
 import copy
+import operator
 import random
 from collections import OrderedDict
 from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Any, cast
+from typing import Any, Literal, cast, overload
 
 import torch
 from torch import nn
 
 from .depth import DepthStack, make_extra
-from .graph import ChannelGraph, analyze, check_plain
+from .graph import ChannelGraph, GroupInfo, analyze, check_plain
 from .layers import DynamicBatchNorm, DynamicConv2d, DynamicLinear, DynamicModule, segments_index
 
 __all__ = ["NetAugModel"]
 
 # (tensor name relative to the wrapped model, dim, offset, group id)
 _PermOp = tuple[str, int, int, int]
+
+# Modules that only hold other modules: never a block of their own for group_kinds().
+_CONTAINERS = (nn.Sequential, nn.ModuleList, nn.ModuleDict, DepthStack)
+_SCOPES = ("all", "closed", "inner")
 
 
 def _check_no_shared_parameters(model: nn.Module, graph: ChannelGraph) -> None:
@@ -618,35 +623,166 @@ class NetAugModel(nn.Module):
                                 ops[g].append((f"{name}.{attr}", 0, off, g))
         return ops
 
-    @torch.no_grad()
-    def channel_importance(self) -> dict[int, torch.Tensor]:
+    def _importance_terms(self, g: int, ops: list[_PermOp]) -> list[tuple[str, int, int]]:
+        """The weight slices that rank group ``g``: ``(tensor name, dim, offset)``.
+
+        Layers inside the extra blocks of depth augmentation count only for a group that
+        has no such layer outside them (a group that lives in an extra block), so the
+        ranking of a group the original model has does not depend on the extra blocks.
+        """
+        extra = tuple(f"{p}.extra." for p in self._depth_paths)
+
+        def outside_extras(terms: list[tuple[str, int, int]]) -> list[tuple[str, int, int]]:
+            kept = [t for t in terms if not t[0].startswith(extra)]
+            return kept or terms
+
+        readers = outside_extras([(n, d, o) for n, d, o, _ in ops if d == 1])
+        if not readers:
+            readers = outside_extras(
+                [
+                    (f"{name}.weight", 0, 0)
+                    for name, role in self.graph.layers.items()
+                    if role.kind == "dense" and role.out_group == g
+                ]
+            )
+        return readers
+
+    @staticmethod
+    def _slice_importance(t: torch.Tensor, d: int, o: int, size: int) -> torch.Tensor:
+        """L1 norm of ``t.narrow(d, o, size)`` over every dim except ``d``."""
+        w = t.detach().narrow(d, o, size).abs()
+        w = w.to(torch.promote_types(w.dtype, torch.float32))
+        dims = [i for i in range(w.dim()) if i != d]
+        return w.sum(dim=dims) if dims else w
+
+    @overload
+    def channel_importance(self, *, per_reader: Literal[False] = False) -> dict[int, torch.Tensor]: ...
+    @overload
+    def channel_importance(self, *, per_reader: Literal[True]) -> dict[int, dict[str, torch.Tensor]]: ...
+    def channel_importance(
+        self, *, per_reader: bool = False
+    ) -> dict[int, torch.Tensor] | dict[int, dict[str, torch.Tensor]]:
         """L1 importance of each channel of each free group (max-width layout).
 
         A channel is important if the layers that *read* it give it large weights. If a
-        group has no dense reader, the producers' output weights are used instead.
+        group has no dense reader, the dense producers' output weights are used instead
+        (batch-norm and depthwise weights are never used). A group with neither gets zeros.
+        The extra blocks of depth augmentation count only for a group that lives in them.
+
+        With ``per_reader=True`` the result is ``{group: {layer path: importance}}``: one
+        tensor per dense reader (the segments of a layer that reads the group several times
+        through a concat are added), or per dense producer when the group has no reader, in
+        ``graph.layers`` order. The tensors of a group add up to its default importance; a
+        group with neither readers nor producers gets an empty dict.
         """
-        tensors = dict(self.model.named_parameters())
-        result: dict[int, torch.Tensor] = {}
-        for g, ops in self._perm_ops().items():
-            size = self.max_sizes[g]
-            readers = [(n, d, o) for n, d, o, _ in ops if d == 1]
-            if not readers:
-                readers = [(n, d, o) for n, d, o, _ in ops if d == 0 and n.endswith(".weight")]
-            imp = None
-            for n, d, o in readers:
-                w = tensors[n].detach().narrow(d, o, size).abs()
-                w = w.to(torch.promote_types(w.dtype, torch.float32))
-                dims = [i for i in range(w.dim()) if i != d]
-                v = w.sum(dim=dims) if dims else w
-                imp = v if imp is None else imp + v
-            result[g] = imp if imp is not None else torch.zeros(size)
-        return result
+        with torch.no_grad():
+            tensors = dict(self.model.named_parameters())
+            if per_reader:
+                order = {name: i for i, name in enumerate(self.graph.layers)}
+                split: dict[int, dict[str, torch.Tensor]] = {}
+                for g, ops in self._perm_ops().items():
+                    parts: dict[str, torch.Tensor] = {}
+                    for n, d, o in self._importance_terms(g, ops):
+                        layer = n.removesuffix(".weight")
+                        v = self._slice_importance(tensors[n], d, o, self.max_sizes[g])
+                        parts[layer] = parts[layer] + v if layer in parts else v
+                    split[g] = {k: parts[k] for k in sorted(parts, key=order.__getitem__)}
+                return split
+            result: dict[int, torch.Tensor] = {}
+            for g, ops in self._perm_ops().items():
+                size = self.max_sizes[g]
+                imp = None
+                for n, d, o in self._importance_terms(g, ops):
+                    v = self._slice_importance(tensors[n], d, o, size)
+                    imp = v if imp is None else imp + v
+                result[g] = imp if imp is not None else torch.zeros(size)
+            return result
+
+    def group_kinds(self, blocks: Iterable[str | type[nn.Module]] | None = None) -> dict[int, GroupInfo]:
+        """Classify every channel group (see :class:`~torchnetaug.graph.GroupInfo`).
+
+        ``blocks=None`` finds the blocks automatically: non-container modules (not
+        ``nn.Sequential`` / ``nn.ModuleList`` / ``nn.ModuleDict`` / ``DepthStack`` or a
+        subclass) that hold at least one whole group, and inside which no candidate block
+        shares more than one group with the outside. Otherwise ``blocks`` lists module paths
+        in the wrapped model (``self.model``) or module classes (every instance is a block),
+        and only those are used. The extra blocks of depth augmentation come from the model.
+        """
+        extras = [f"{p}.extra.{i}" for p in self._depth_paths for i in range(len(self._stack(p).extra))]
+        paths = self._auto_blocks() if blocks is None else self._resolve_blocks(blocks)
+        return self.graph.group_kinds(paths, extras)
+
+    def _resolve_blocks(self, blocks: Iterable[str | type[nn.Module]]) -> list[str]:
+        modules = dict(self.model.named_modules())
+        paths: list[str] = []
+        for b in blocks:
+            if isinstance(b, str):
+                if b not in modules:
+                    raise ValueError(f"block {b!r} is not a module path of the wrapped model")
+                paths.append(b)
+            elif isinstance(b, type):
+                paths += [p for p, m in modules.items() if p and isinstance(m, b)]
+            else:
+                raise TypeError(f"a block must be a module path (str) or a module class, got {b!r}")
+        return paths
+
+    def _auto_blocks(self) -> list[str]:
+        layers = self.graph.layers
+        layers_of = self.graph._group_layers()
+
+        def inside(n: str, p: str) -> bool:
+            return n.startswith(p + ".")
+
+        cands = [
+            p
+            for p, m in self.model.named_modules()
+            if p and not isinstance(m, _CONTAINERS) and p not in layers and any(inside(n, p) for n in layers)
+        ]
+        internal = {p: {g for g, ls in layers_of.items() if all(inside(n, p) for n in ls)} for p in cands}
+        external = {
+            p: {g for g, ls in layers_of.items() if any(inside(n, p) for n in ls) and not all(inside(n, p) for n in ls)}
+            for p in cands
+        }
+        units = [p for p in cands if internal[p]]
+        return [p for p in units if all(len(external[d]) <= 1 for d in units if inside(d, p))]
+
+    def _group_id(self, key: Any, what: str) -> int:
+        """``key`` as the id of a free group, or ``ValueError``."""
+        try:
+            if isinstance(key, bool):
+                raise TypeError
+            g = operator.index(key)
+        except TypeError:
+            raise ValueError(f"{what} {key!r} is not a group id (an int)") from None
+        if not 0 <= g < self.graph.num_groups:
+            raise ValueError(f"{what} {g} is not a group id (0 .. {self.graph.num_groups - 1})")
+        if self.graph.group_fixed[g]:
+            raise ValueError(f"group {g} is fixed and cannot be permuted")
+        return g
+
+    def _scope_groups(self, scope: Any, blocks: Iterable[str | type[nn.Module]] | None) -> set[int] | None:
+        """The groups that ``sort_channels`` sorts for ``scope`` (``None`` = every free group)."""
+        if isinstance(scope, str):
+            if scope == "all":
+                return None
+            if scope in ("inner", "closed"):
+                wanted = {"inner"} if scope == "inner" else {"inner", "closed"}
+                return {g for g, info in self.group_kinds(blocks).items() if info.kind in wanted}
+            raise ValueError(f"scope must be one of {_SCOPES} or an iterable of group ids, got {scope!r}")
+        try:
+            keys = list(scope)
+        except TypeError:
+            raise ValueError(f"scope must be one of {_SCOPES} or an iterable of group ids, got {scope!r}") from None
+        return {self._group_id(k, "scope entry") for k in keys}
 
     @torch.no_grad()
     def sort_channels(
         self,
         optimizer: torch.optim.Optimizer | None = None,
         extra_models: Iterable[NetAugModel] = (),
+        *,
+        scope: str | Iterable[int] = "all",
+        blocks: Iterable[str | type[nn.Module]] | None = None,
     ) -> dict[int, torch.Tensor]:
         """Reorder channels so the most important ones come first.
 
@@ -658,31 +794,95 @@ class NetAugModel(nn.Module):
 
         ``optimizer`` state tensors with the same shape as a permuted parameter (momentum,
         Adam moments, ...) get the same permutation. ``extra_models`` (e.g. an EMA copy with
-        the same structure) are permuted with the same permutations.
+        the same structure) are permuted with the same permutations. Each extra model must
+        be a :class:`NetAugModel` with the same channel groups, layer roles and maximum
+        sizes; otherwise ``ValueError`` is raised before anything changes.
 
-        Returns ``{group_id: permutation}``.
+        ``scope`` chooses the groups to sort: ``"all"`` (every free group), ``"inner"`` (the
+        ``"inner"`` groups of :meth:`group_kinds`), ``"closed"`` (``"inner"`` and
+        ``"closed"`` groups), or an iterable of free group ids. ``blocks`` is passed to
+        :meth:`group_kinds` for ``"inner"`` and ``"closed"``. Groups outside the scope are
+        not changed at all.
+
+        Returns ``{group_id: permutation}`` for the sorted groups.
         """
+        groups = self._scope_groups(scope, blocks)
+        extras = list(extra_models)
+        for i, other in enumerate(extras):
+            self._check_same_groups(other, f"extra_models[{i}]")
         importance = self.channel_importance()
-        perms = {g: torch.argsort(imp, descending=True, stable=True) for g, imp in importance.items()}
+        perms = {
+            g: torch.argsort(imp, descending=True, stable=True)
+            for g, imp in importance.items()
+            if groups is None or g in groups
+        }
         self.apply_permutations(perms, optimizer)
-        for other in extra_models:
+        for other in extras:
             other.apply_permutations(perms)
         return perms
+
+    def _check_same_groups(self, other: Any, what: str) -> None:
+        """Raise ``ValueError`` unless ``other`` has the same group graph and max sizes."""
+        if not isinstance(other, NetAugModel):
+            raise ValueError(f"{what} must be a NetAugModel, got {type(other).__name__}")  # noqa: TRY004
+        checks = (
+            ("group sizes", list(other.graph.group_sizes), list(self.graph.group_sizes)),
+            ("fixed groups", list(other.graph.group_fixed), list(self.graph.group_fixed)),
+            ("layer roles", dict(other.graph.layers), dict(self.graph.layers)),
+            ("max sizes", list(other.max_sizes), list(self.max_sizes)),
+        )
+        for label, theirs, ours in checks:
+            if theirs != ours:
+                raise ValueError(f"{what} does not match this model: different {label}")
+
+    def _check_permutations(self, perms: Mapping[Any, Any]) -> dict[int, torch.Tensor]:
+        """Validate ``{group_id: permutation}`` and return it with int keys and int64 CPU values."""
+        checked: dict[int, torch.Tensor] = {}
+        for key, perm in perms.items():
+            g = self._group_id(key, "permutation key")
+            if (
+                not isinstance(perm, torch.Tensor)
+                or perm.dim() != 1
+                or perm.dtype == torch.bool
+                or perm.is_floating_point()
+                or perm.is_complex()
+            ):
+                desc = f"{perm.dtype} tensor of shape {tuple(perm.shape)}" if isinstance(perm, torch.Tensor) else perm
+                raise ValueError(f"group {g}: the permutation must be a 1-D integer tensor, got {desc!r}")
+            n = self.max_sizes[g]
+            if perm.numel() != n:
+                raise ValueError(f"group {g}: the permutation has {perm.numel()} entries, expected {n}")
+            p = perm.detach().to("cpu", torch.int64)
+            if not torch.equal(torch.sort(p).values, torch.arange(n)):
+                raise ValueError(f"group {g}: {p.tolist()} is not a permutation of 0 .. {n - 1}")
+            checked[g] = p
+        return checked
 
     @torch.no_grad()
     def apply_permutations(
         self, perms: dict[int, torch.Tensor], optimizer: torch.optim.Optimizer | None = None
     ) -> None:
-        """Apply ``{group_id: permutation}``: new channel ``i`` = old channel ``perm[i]``."""
+        """Apply ``{group_id: permutation}``: new channel ``i`` = old channel ``perm[i]``.
+
+        ``perms`` may cover only some free groups. Every entry is checked first: the key
+        must be a free group id and the value a 1-D integer tensor that is a permutation of
+        ``0 .. max_sizes[g] - 1``. Otherwise ``ValueError`` is raised and nothing changes.
+
+        The ``.grad`` of a permuted parameter, if it has one, gets the same permutation.
+        """
+        checked = self._check_permutations(perms)
         tensors: dict[str, torch.Tensor] = dict(self.model.named_parameters())
         tensors.update(dict(self.model.named_buffers()))
         params = dict(self.model.named_parameters())
         for g, ops in self._perm_ops().items():
-            if g not in perms:
+            if g not in checked:
                 continue
-            perm = perms[g]
+            perm = checked[g]
             for name, dim, off, _ in ops:
                 targets = [tensors[name]]
+                grad = params[name].grad if name in params else None
+                if grad is not None:
+                    targets.append(grad)
                 if optimizer is not None and name in params:
                     state = optimizer.state.get(params[name], {})
                     targets += [v for v in state.values() if torch.is_tensor(v) and v.shape == params[name].shape]

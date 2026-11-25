@@ -23,7 +23,7 @@ from __future__ import annotations
 import copy
 import math
 import operator
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,7 +35,7 @@ from torch.fx.passes.shape_prop import ShapeProp, TensorMetadata
 from .depth import DepthStack, tie_channels
 from .layers import DynamicModule
 
-__all__ = ["ChannelGraph", "LayerRole", "TraceError", "analyze", "check_plain"]
+__all__ = ["ChannelGraph", "GroupInfo", "LayerRole", "TraceError", "analyze", "check_plain"]
 
 
 class TraceError(RuntimeError):
@@ -57,6 +57,42 @@ class LayerRole:
     kind: str
     in_groups: tuple[int, ...]
     out_group: int | None = None
+
+
+def _inside(name: str, path: str) -> bool:
+    """True if the layer ``name`` lies inside the module at ``path``."""
+    return name.startswith(path + ".")
+
+
+@dataclass(frozen=True)
+class GroupInfo:
+    """What kind of channel group ``group`` is, and which layers touch it.
+
+    ``kind`` is the first of these that applies:
+
+    * ``"fixed"``: the group keeps its original width and order.
+    * ``"depth-tied"``: the group has layers both inside and outside an extra block of
+      depth augmentation.
+    * ``"inner"``: every layer of the group lies inside one block (``block`` is the
+      innermost such block).
+    * ``"concat-segment"``: the group is one of several groups that a layer reads as a
+      concatenation.
+    * ``"residual"``: the group has more than one dense producer (a residual sum).
+    * ``"closed"``: any other free group.
+
+    ``producers`` are the dense layers whose output is the group, ``members`` the batch
+    norm / depthwise layers on the group, ``readers`` the dense layers that read it.
+    ``modules`` are the layers that sorting the group changes (empty for a fixed group).
+    All names are in ``ChannelGraph.layers`` order.
+    """
+
+    group: int
+    kind: str
+    block: str | None
+    producers: tuple[str, ...]
+    members: tuple[str, ...]
+    readers: tuple[str, ...]
+    modules: tuple[str, ...]
 
 
 @dataclass
@@ -85,6 +121,49 @@ class ChannelGraph:
                 reason = " (" + "; ".join(sorted(set(self.fixed_reasons[g]))[:3]) + ")"
             lines.append(f"  group {g}: {size} ch, {status}{reason}, producers={producers}")
         return "\n".join(lines)
+
+    def _group_layers(self) -> dict[int, list[str]]:
+        """For each group, the layers that touch it: readers, members and dense producers."""
+        out: dict[int, list[str]] = {g: [] for g in range(self.num_groups)}
+        for name, role in self.layers.items():
+            groups = dict.fromkeys(role.in_groups)
+            if role.kind == "dense" and role.out_group is not None:
+                groups[role.out_group] = None
+            for g in groups:
+                out[g].append(name)
+        return out
+
+    def group_kinds(self, blocks: Iterable[str] = (), extras: Iterable[str] = ()) -> dict[int, GroupInfo]:
+        """Classify every group (see :class:`GroupInfo`), using only layer names and roles.
+
+        ``blocks`` are module paths of blocks (for ``"inner"``); ``extras`` are module paths
+        of the extra blocks of depth augmentation (for ``"depth-tied"``). A layer ``n`` is
+        inside path ``p`` when ``n`` starts with ``p + "."``.
+        """
+        blocks, extras = list(blocks), list(extras)
+        concat = {g for role in self.layers.values() if len(role.in_groups) > 1 for g in role.in_groups}
+        result: dict[int, GroupInfo] = {}
+        for g, names in self._group_layers().items():
+            roles = [self.layers[n] for n in names]
+            producers = tuple(n for n, r in zip(names, roles) if r.kind == "dense" and r.out_group == g)
+            members = tuple(n for n, r in zip(names, roles) if r.kind != "dense")
+            readers = tuple(n for n, r in zip(names, roles) if r.kind == "dense" and g in r.in_groups)
+            block = None
+            if self.group_fixed[g]:
+                kind = "fixed"
+            elif any(any(_inside(n, e) for n in names) and not all(_inside(n, e) for n in names) for e in extras):
+                kind = "depth-tied"
+            elif inner := [b for b in blocks if all(_inside(n, b) for n in names)]:
+                kind, block = "inner", max(inner, key=len)
+            elif g in concat:
+                kind = "concat-segment"
+            elif len(producers) > 1:
+                kind = "residual"
+            else:
+                kind = "closed"
+            modules = () if kind == "fixed" else tuple(names)
+            result[g] = GroupInfo(g, kind, block, producers, members, readers, modules)
+        return result
 
 
 # --------------------------------------------------------------------------------------
