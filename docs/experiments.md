@@ -2,7 +2,7 @@
 
 **繁體中文** | [English](experiments.en.md)
 
-日期：2026-11-19（CIFAR-10）、2026-11-23–24（CIFAR-100）。程式設計與正確性驗證見 [design.md](design.md)，專案總結見 [summary.md](../summary.md)，術語見 [glossary.md](glossary.md)。
+日期：2026-11-19（CIFAR-10）、2026-11-23–24（CIFAR-100）；排序消融（第 4.7 節）執行中。程式設計與正確性驗證見 [design.md](design.md)，專案總結見 [summary.md](../summary.md)，術語見 [glossary.md](glossary.md)。
 
 ## 1. 重點
 
@@ -16,15 +16,15 @@
 flowchart LR
     Q["NetAug 為什麼沒效果？"] --> A["設定不適合？<br/>→ 第 4.1、4.2 節：欠擬合設定仍無增益"]
     Q --> B["實作有錯？<br/>→ 測試與第 4.3–4.5 節：沒有找到錯誤"]
-    Q --> C["方法在此範圍無效？<br/>→ 第 4.7 節：可能，未證實"]
+    Q --> C["方法在此範圍無效？<br/>→ 第 4.8 節：可能，未證實"]
 ```
 
 ## 2. 共同設定
 
 | 項目 | 設定 |
 |---|---|
-| 程式碼 | 分支 `feat/torchnetaug`：CIFAR-10 寬度 `941b37a`、深度 `83e5073`、CIFAR-100 `f81bdfc` |
-| 環境 | Python 3.14.3、PyTorch 2.11.0+cu128、Windows 10、RTX 3060 Ti 8 GB（bf16）；Colab Tesla T4 15 GB（CIFAR-100 補齊至 8 個 seed 的後半批次，fp16） |
+| 程式碼 | 分支 `feat/torchnetaug`：CIFAR-10 寬度 `941b37a`、深度 `83e5073`、CIFAR-100 `f81bdfc`、排序消融 `13a9f0e` |
+| 環境 | Python 3.14.3、PyTorch 2.11.0+cu128、Windows 10、RTX 3060 Ti 8 GB（bf16）；Colab Tesla T4 15 GB（CIFAR-100 補齊至 8 個 seed 的後半批次與排序消融，fp16） |
 | 模型 | TinyResNet：CIFAR 版 ResNet-18，寬度 1/8（8、16、32、64 通道，176,402 個參數）；`--width` 再乘上 base 寬度倍數 |
 | 訓練 | 40 epoch、batch 128、Nesterov SGD（momentum 0.9）、lr 0.1 cosine、weight decay 5e-4（BN 與 bias 不做）、隨機裁切與水平翻轉、16-bit autocast（3060 Ti 用 bf16，T4 用 fp16） |
 | NetAug | `width_mults=(1.0, 2.0, 3.0)`、`alpha=1.0`、每個通道群組各自抽寬度、全程增強 |
@@ -154,13 +154,41 @@ CIFAR-10 的效果很小。本節檢查原因：設定不適合、實作有問�
 - 這個模型不適合直接下結論：總步幅 32 讓 32×32 輸入最後只剩 1×1，baseline 只有 41.6%。寬度仍有幫助：寬度 0.5 單獨訓練是 45.02%（81.6 萬個參數）。
 - 原始資料在 `runs/diag/mbv2_default_init/`。
 
-### 4.7 可能的原因（未證實）
+### 4.7 排序消融（1 個 seed，執行中）
+
+本節檢查通道排序的三個選擇是否影響訓練結果：排序範圍、重要度的合計方式，以及排序時怎麼處理 optimizer 狀態。官方實作只排序 inner 群組、重要度只用一個讀取者，而且排序時不重排動量。本套件預設排序所有可增強群組、加總所有 dense 讀取者的重要度，並重排 optimizer 狀態。差異見 [official_diff.md](official_diff.md)，排序的設計見 [design.md 第 5 節](design.md#5-通道排序)。
+
+每個設定只改變一個因素，參考設定是 `all`。除了 `none`，所有設定都每個 epoch 排序一次（`--sort-every 1`）。實驗用 CIFAR-100、40 epoch、seed 0，模型是 MobileNetV2（`mbv2_035`）與 TinyResNet（`resnet_tiny`），共 15 次執行。`resnet_tiny` 沒有 closed 群組，`closed` 會等於 `inner`，所以不執行。
+
+| 設定 | 選項 | 檢查什麼 |
+|---|---|---|
+| `none` | `--sort-every 0` | 不排序：排序本身的效果 |
+| `inner` | `--sort-scope inner` | 官方實作的排序範圍：只排序 inner 群組 |
+| `closed` | `--sort-scope closed` | 排序 inner 群組與 closed 群組（只有 `mbv2_035`） |
+| `all` | `--sort-every 1` | 參考設定：所有可增強群組、加總重要度、重排 optimizer 狀態 |
+| `all-mean` | `--sort-agg mean` | 每個讀取者的 L1 先除以該讀取者每個通道的權重數，再加總 |
+| `all-single` | `--sort-agg single` | 只用第一個讀取者的 L1（官方實作只用一個讀取者） |
+| `all-keep` | `--sort-opt keep` | 不重排 optimizer 狀態（官方實作的作法），動量和參數的通道會錯位 |
+| `all-rebuild` | `--sort-opt rebuild` | 排序後清除 optimizer 狀態，動量從 0 開始；lr 排程不變 |
+
+每次排序在 jsonl 的 `sort_log` 記錄下列數值：
+
+- 範圍內的群組數與這次改變順序的群組數（`groups`、`sorted_groups`）。
+- 排列和預設排序（加總重要度、所有可增強群組）不同的群組數（`diff_from_default`）。它確認這個設定真的改變了排列。
+- 移入 base 的通道數（`moved_into_base`）：排序後在 base 寬度內、排序前在 base 寬度外的通道。
+- 最大寬度網路在 500 張測試影像上的輸出最大變化（`max_abs_diff`，對照最大 logit `max_abs_logit`）。排序應保持函數不變，所以這個值應接近 0。
+
+結果待補：實驗在 Colab 上等待 GPU 額度。結果表與圖 `figures/sort_ablation.png` 由 `examples/sort_report.py` 產生（見第 6 節）。
+
+只有 1 個 seed，所以小於約 0.5 個百分點的差異無法和 seed 雜訊區分（見第 5 節）。
+
+### 4.8 可能的原因（未證實）
 
 論文的增益來自 ImageNet 上的 MobileNet 類模型，增強會加寬 inverted block 的 expand 通道，訓練 150 epoch 加 5 epoch warmup。本實驗的架構、資料集與訓練長度都不同。
 
 ## 5. 限制
 
-- CIFAR-10 每種設定只有 3 個 seed；CIFAR-100 每種設定 8 個 seed；MobileNetV2 只有 1 個 seed。小於約 0.5 個百分點的差異無法和 seed 雜訊區分。
+- CIFAR-10 每種設定只有 3 個 seed；CIFAR-100 每種設定 8 個 seed；MobileNetV2 與排序消融只有 1 個 seed。小於約 0.5 個百分點的差異無法和 seed 雜訊區分。
 - 只用 40 epoch（對照組 80 epoch）、32×32 影像與兩種架構，沒有測 ImageNet。
 - 部分執行期間顯示卡同時在跑其他程式，且後半批次在 Colab Tesla T4 上以 fp16 執行，所以執行時間只能大略參考。
 
@@ -177,9 +205,13 @@ uv run python examples/summarize.py runs/cifar10_compare.jsonl runs/cifar10_dept
 bash examples/run_diagnosis.sh                         # 第 4 節（全部 7 個階段，各 8 個 seed）
 uv run python examples/summarize.py --ref-epochs 40 runs/diag/method_*.jsonl
 uv run python examples/plot_results.py --out runs/plots --ref-epochs 40 runs/diag/method_*.jsonl
+
+uv run python examples/sort_ablation.py --seeds 0      # 第 4.7 節（15 次執行，結果在 runs/sort_ablation.jsonl）
+uv run python examples/sort_report.py runs/sort_ablation.jsonl --lang zh --plot docs/figures
 ```
 
 - `run_diagnosis.sh` 的階段：`main`（8 個 seed）、`dose`（base 寬度 0.5、1.0）、`controls`、`alone`、`ablations`、`sanity`、`recipe`。已完成的執行會跳過。
 - `cifar_netaug.py` 的主要選項：`--width`（base 寬度倍數）、`--depth`、`--init {base,max}`、`--stop-aug`、`--sort-every`、`--granularity {group,global}`、`--grad-log-every N`、`--amp {bf16,fp16,off}`、`--warmup N`。
+- `sort_report.py` 把第 4.7 節的結果表印到標準輸出（`--lang en` 產生英文表頭），`--plot` 寫出 `sort_ablation.png`。
 - `examples/run_cifar100_regime.sh` 是較早的 CIFAR-100 對照腳本，本文件沒有使用它的結果。
 - MobileNetV2：`uv run python examples/cifar_netaug.py --model {mbv2_035,mbv2_050} --method {baseline,netaug} --dataset cifar100 --epochs 40 --seed 0 --eval-widths 1.0 2.0 3.0 --out <檔案>`，可加 `--warmup 5`、`--grad-log-every 20`、`--alpha 0` 或 `--lr 0.05 --wd 1e-3`。

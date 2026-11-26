@@ -2,7 +2,7 @@
 
 [繁體中文](experiments.md) | **English**
 
-Dates: 2026-11-19 (CIFAR-10), 2026-11-23–24 (CIFAR-100). For the code design and correctness verification, see [design.en.md](design.en.md). For the project summary, see [summary.en.md](../summary.en.md). For terms, see [glossary.md](glossary.md).
+Dates: 2026-11-19 (CIFAR-10), 2026-11-23–24 (CIFAR-100); the sorting ablation (Section 4.7) is in progress. For the code design and correctness verification, see [design.en.md](design.en.md). For the project summary, see [summary.en.md](../summary.en.md). For terms, see [glossary.md](glossary.md).
 
 ## 1. Key points
 
@@ -16,15 +16,15 @@ Dates: 2026-11-19 (CIFAR-10), 2026-11-23–24 (CIFAR-100). For the code design a
 flowchart LR
     Q["Why does NetAug not help?"] --> A["Unsuitable setup?<br/>→ Sections 4.1, 4.2: no gain even in an underfitting setup"]
     Q --> B["Implementation error?<br/>→ Tests and Sections 4.3–4.5: no error found"]
-    Q --> C["Method does not work in this scope?<br/>→ Section 4.7: possible, not proven"]
+    Q --> C["Method does not work in this scope?<br/>→ Section 4.8: possible, not proven"]
 ```
 
 ## 2. Common setup
 
 | Item | Setting |
 |---|---|
-| Code | Branch `feat/torchnetaug`: CIFAR-10 width `941b37a`, depth `83e5073`, CIFAR-100 `f81bdfc` |
-| Environment | Python 3.14.3, PyTorch 2.11.0+cu128, Windows 10, RTX 3060 Ti 8 GB (bf16); Colab Tesla T4 15 GB (second batch completing 8 seeds on CIFAR-100, fp16) |
+| Code | Branch `feat/torchnetaug`: CIFAR-10 width `941b37a`, depth `83e5073`, CIFAR-100 `f81bdfc`, sorting ablation `13a9f0e` |
+| Environment | Python 3.14.3, PyTorch 2.11.0+cu128, Windows 10, RTX 3060 Ti 8 GB (bf16); Colab Tesla T4 15 GB (second batch completing 8 seeds on CIFAR-100, and the sorting ablation, fp16) |
 | Model | TinyResNet: CIFAR ResNet-18 at 1/8 width (8, 16, 32, 64 channels, 176,402 parameters); `--width` multiplies this by a base width multiplier |
 | Training | 40 epochs, batch 128, Nesterov SGD (momentum 0.9), lr 0.1 cosine, weight decay 5e-4 (not on BN and bias), random crop and horizontal flip, 16-bit autocast (bf16 on 3060 Ti, fp16 on T4) |
 | NetAug | `width_mults=(1.0, 2.0, 3.0)`, `alpha=1.0`, each channel group samples its own width, augmentation for the whole run |
@@ -154,13 +154,41 @@ The gains of the paper come from MobileNet-class models, so torchvision MobileNe
 - This model is not suitable for a direct conclusion: the total stride is 32, so a 32×32 input becomes 1×1 at the end, and the baseline reaches only 41.6%. Width still helps: width 0.5 trained alone gives 45.02% (816,000 parameters).
 - The raw data is in `runs/diag/mbv2_default_init/`.
 
-### 4.7 Possible causes (not proven)
+### 4.7 Sorting ablation (1 seed, in progress)
+
+This section checks whether three choices of channel sorting change the training result: the sort scope, how the importance is combined, and what happens to the optimizer state at a sort. The official implementation sorts only inner groups, uses the importance of one reader, and does not permute the momentum at a sort. By default this package sorts every free group, sums the importance of all dense readers, and permutes the optimizer state. For the differences, see [official_diff.en.md](official_diff.en.md). For the design of sorting, see [Section 5 of design.en.md](design.en.md#5-channel-sorting).
+
+Each setting changes one factor, and the reference setting is `all`. Every setting except `none` sorts once per epoch (`--sort-every 1`). The experiment uses CIFAR-100, 40 epochs and seed 0, with MobileNetV2 (`mbv2_035`) and TinyResNet (`resnet_tiny`): 15 runs in total. `resnet_tiny` has no closed groups, so `closed` would equal `inner` and is not run.
+
+| Setting | Options | What it tests |
+|---|---|---|
+| `none` | `--sort-every 0` | No sorting: the effect of sorting itself |
+| `inner` | `--sort-scope inner` | The sort scope of the official implementation: inner groups only |
+| `closed` | `--sort-scope closed` | Sorts inner groups and closed groups (`mbv2_035` only) |
+| `all` | `--sort-every 1` | Reference setting: every free group, summed importance, permuted optimizer state |
+| `all-mean` | `--sort-agg mean` | The L1 of each reader is divided by that reader's weights per channel, then summed |
+| `all-single` | `--sort-agg single` | Only the L1 of the first reader (the official implementation uses one reader) |
+| `all-keep` | `--sort-opt keep` | The optimizer state is not permuted (as in the official implementation), so the channels of the momentum and the parameters no longer match |
+| `all-rebuild` | `--sort-opt rebuild` | The optimizer state is cleared after each sort, so the momentum starts again from 0; the lr schedule does not change |
+
+Each sort records these values in `sort_log` of the jsonl file:
+
+- The number of groups in the scope, and the number of groups whose order this sort changed (`groups`, `sorted_groups`).
+- The number of groups whose permutation differs from the default sort (summed importance, every free group) (`diff_from_default`). It confirms that the setting really changed the permutation.
+- The number of channels moved into the base (`moved_into_base`): channels inside the base width after the sort that were outside it before.
+- The largest change of the max-width network output on 500 test images (`max_abs_diff`, next to the largest logit `max_abs_logit`). A sort must keep the function the same, so this value must be close to 0.
+
+Results to be added: the experiment is waiting for GPU quota on Colab. `examples/sort_report.py` writes the results table and the figure `figures/sort_ablation.png` (see Section 6).
+
+There is only 1 seed, so differences smaller than about 0.5 percentage points cannot be told apart from seed noise (see Section 5).
+
+### 4.8 Possible causes (not proven)
 
 The gains of the paper come from MobileNet-class models on ImageNet, where augmentation widens the expand channels of the inverted blocks, trained for 150 epochs with 5 epochs of warmup. The architecture, the dataset and the training length of these experiments are all different.
 
 ## 5. Limitations
 
-- CIFAR-10 has only 3 seeds per setting; CIFAR-100 has 8 seeds per setting; MobileNetV2 has only 1 seed. Differences smaller than about 0.5 percentage points cannot be told apart from seed noise.
+- CIFAR-10 has only 3 seeds per setting; CIFAR-100 has 8 seeds per setting; MobileNetV2 and the sorting ablation have only 1 seed. Differences smaller than about 0.5 percentage points cannot be told apart from seed noise.
 - Only 40 epochs (80 for a control), 32×32 images and two architectures were used. ImageNet was not tested.
 - During some runs the GPU was also running other programs, and the second batch ran in fp16 on a Colab Tesla T4, so the run times are only approximate.
 
@@ -177,9 +205,13 @@ uv run python examples/summarize.py runs/cifar10_compare.jsonl runs/cifar10_dept
 bash examples/run_diagnosis.sh                         # Section 4 (all 7 stages, 8 seeds each)
 uv run python examples/summarize.py --ref-epochs 40 runs/diag/method_*.jsonl
 uv run python examples/plot_results.py --out runs/plots --ref-epochs 40 runs/diag/method_*.jsonl
+
+uv run python examples/sort_ablation.py --seeds 0      # Section 4.7 (15 runs, results in runs/sort_ablation.jsonl)
+uv run python examples/sort_report.py runs/sort_ablation.jsonl --lang en --plot docs/figures
 ```
 
 - The stages of `run_diagnosis.sh`: `main` (8 seeds), `dose` (base width 0.5, 1.0), `controls`, `alone`, `ablations`, `sanity`, `recipe`. Finished runs are skipped.
 - Main options of `cifar_netaug.py`: `--width` (base width multiplier), `--depth`, `--init {base,max}`, `--stop-aug`, `--sort-every`, `--granularity {group,global}`, `--grad-log-every N`, `--amp {bf16,fp16,off}`, `--warmup N`.
+- `sort_report.py` prints the results table of Section 4.7 to standard output (`--lang zh` gives the Chinese header row); `--plot` writes `sort_ablation.png`.
 - `examples/run_cifar100_regime.sh` is an earlier CIFAR-100 control script. This document does not use its results.
 - MobileNetV2: `uv run python examples/cifar_netaug.py --model {mbv2_035,mbv2_050} --method {baseline,netaug} --dataset cifar100 --epochs 40 --seed 0 --eval-widths 1.0 2.0 3.0 --out <file>`, optionally with `--warmup 5`, `--grad-log-every 20`, `--alpha 0`, or `--lr 0.05 --wd 1e-3`.
