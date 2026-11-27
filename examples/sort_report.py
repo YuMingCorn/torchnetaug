@@ -256,7 +256,7 @@ def plot(groups: dict, out: Path) -> Path | None:
         ax.axvline(0, color=MUTED, linewidth=1)
         for x in (-THRESHOLD, THRESHOLD):
             ax.axvline(x, color=MUTED, linewidth=1, linestyle="--")
-        span = max(extent) * 1.4  # room for the value labels
+        span = max(extent) * 1.6  # room for the value labels
         ax.set_xlim(-span, span)
         ax.set_yticks(ys, settings)
         ax.grid(axis="y", visible=False)
@@ -268,7 +268,9 @@ def plot(groups: dict, out: Path) -> Path | None:
     head = f"{DATASETS.get(ds, ds)}, {ep} epochs: " if one_facet else ""
     many = any(len(rs) > 1 for f in facets for rs in groups[f].values())
     stat = "paired by seed, mean and 95% CI; " if many else ""
-    fig.suptitle(f"{head}channel-sorting ablation ({stat}dashed lines at ±{THRESHOLD:g} points)", y=1.02)
+    fig.suptitle(
+        f"{head}channel-sorting ablation ({stat}blue: no sorting; dashed lines at ±{THRESHOLD:g} points)", y=1.02
+    )
     fig.subplots_adjust(wspace=0.45)
     out.mkdir(parents=True, exist_ok=True)
     save(fig, out, "sort_ablation.png")

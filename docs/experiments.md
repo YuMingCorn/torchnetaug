@@ -206,11 +206,11 @@ CIFAR-100，40 epoch，seed 0, 1, 2。
 
 觀察：
 
-1. **MobileNetV2 上，NetAug 的結果在 seed 之間差很多，排序減少了損失。** 不排序時 3 個 seed 是 36.50%、28.06%、13.46%；同 seed 的 baseline 是 41.61%、41.81%、41.08%（seed 1、2 另外執行，結果在 `runs/sort_ablation_baseline.jsonl`）。`all` 在每個 seed 都比 `none` 高（+3.41、+5.06、+12.87 個百分點），但仍比 baseline 低 1.70 到 14.75 個百分點。信賴區間跨過 0，所以「排序對 MobileNetV2 有增益」判讀為無法判定。
-2. **MobileNetV2 上，官方實作的排序範圍（`inner`）比 `all` 差**：−2.34 [−4.43, −0.25]，3 個 seed 都是負的（−1.96、−3.30、−1.75）。`closed` 和 `all` 沒有可分辨的差異。
-3. **TinyResNet 上，排序沒有實質增益**：`all` 對 `none` 是 −0.09 [−0.60, +0.42]，`inner` 對 `none` 是 −0.15 [−0.55, +0.24]，上限都小於 +0.5。
-4. **重要度的合計方式與 optimizer 狀態的處理沒有可分辨的效果。** MobileNetV2 上 `all-mean` 幾乎選出和 `all` 相同的排列（每次排序平均 0.1 個群組不同），差異 −0.02 [−0.08, +0.03]。其他設定的平均差異在 −1.48 到 +0.22 個百分點之間，信賴區間都跨過 0。
-5. **排序保持函數不變，但兩個模型移入 base 的通道數差很多。** 最大寬度輸出的最大變化相對於最大 logit：TinyResNet 在 7e-7 以內，MobileNetV2 在 7.4e-4 以內（7.9e-3 對 logit 10.8，原因未檢查）。TinyResNet 每個執行的 39 次排序合計只移入 0 到 2 個通道（與第 3.2、4.5 節一致），MobileNetV2 合計移入 931 到 4,500 個通道。排序只在 MobileNetV2 上有明顯影響，可能和這個差別有關（未證實）。
+1. **MobileNetV2 上，NetAug 的結果在 seed 之間差很多；這 3 個 seed 中，排序都減少了損失。** 不排序時是 36.50%、28.06%、13.46%。同 seed 的 baseline 是 41.61%、41.81%、41.08%（seed 0 在 `runs/diag/mbv2_default_init/`，seed 1、2 在 `runs/sort_ablation_baseline.jsonl`）。`all` 在每個 seed 都比 `none` 高（+3.41、+5.06、+12.87 個百分點），但信賴區間跨過 0，判讀為無法判定。對 baseline，`none` 是 −15.49 [−43.70, +12.72]，`all` 是 −8.38 [−24.60, +7.84]，3 個 seed 都是負的；匯出的 ×3 模型（372 萬個參數）最高也只有 34.21%。
+2. **MobileNetV2 上，官方實作的排序範圍（`inner`）比 `all` 差**：−2.34 [−4.43, −0.25]，3 個 seed 都是負的（−1.96、−3.30、−1.75）。這是對 `all` 的 13 個比較之一，沒有做多重比較校正。`closed` 對 `all` 是 +0.06 [−5.20, +5.32]，判讀為無法判定。
+3. **TinyResNet 上，排序沒有實質增益**：`all` 對 `none` 是 −0.09 [−0.60, +0.42]，`inner` 對 `none` 是 −0.15 [−0.55, +0.24]，上限都小於 +0.5。其他設定對 `none` 都是無法判定。
+4. **重要度的合計方式與 optimizer 狀態的處理，只有 `all-mean`（MobileNetV2）可以判讀。** 它幾乎選出和 `all` 相同的排列（每次排序平均 0.1 個群組不同），差異 −0.02 [−0.08, +0.03]，沒有實質差異。其他設定都是無法判定（信賴區間寬 2.9 到 8.9 個百分點）。TinyResNet 上 `all-mean`、`all-keep`、`all-rebuild` 在 3 個 seed 都低於 `all`；`all-keep` 與 `all-rebuild` 匯出的各寬度也低 1.0 到 1.4 個百分點。
+5. **排序保持函數不變。** 最大寬度輸出的最大變化相對於最大 logit：TinyResNet 在 6.7e-7 以內，MobileNetV2 在 7.3e-4 以內（7.9e-3 對 logit 10.8）。MobileNetV2 的值較大，所以另外用 float64 重算：重跑 10 epoch（`all-single`、seed 2），每次排序前後的輸出差異在 float64 下是 7.4e-14 以內，同一次排序在 float32 下是 2e-6 到 1.4e-4。所以這是 float32 的捨入誤差被網路放大，不是排序改變了函數。移入 base 的通道數差很多：TinyResNet 每個執行的 39 次排序合計 0 到 2 個（與第 3.2、4.5 節一致），MobileNetV2 是 931 到 4,500 個。這可能是只有 MobileNetV2 的結果隨排序明顯變化的原因（未證實）。
 
 ### 4.8 可能的原因（未證實）
 
@@ -218,7 +218,7 @@ CIFAR-100，40 epoch，seed 0, 1, 2。
 
 ## 5. 限制
 
-- CIFAR-10 每種設定只有 3 個 seed；CIFAR-100 每種設定 8 個 seed；MobileNetV2 的第 4.6 節只有 1 個 seed，排序消融只有 3 個 seed。小於約 0.5 個百分點的差異無法和 seed 雜訊區分。
+- CIFAR-10 每種設定只有 3 個 seed；CIFAR-100 每種設定 8 個 seed；MobileNetV2 的第 4.6 節只有 1 個 seed，排序消融只有 3 個 seed。8 個 seed 的 TinyResNet 實驗中，小於約 0.5 個百分點的差異無法和 seed 雜訊區分；3 個 seed 的排序消融不確定性大得多（信賴區間半寬在 TinyResNet 最多 3.9、在 MobileNetV2 最多 16.7 個百分點）。
 - 只用 40 epoch（對照組 80 epoch）、32×32 影像與兩種架構，沒有測 ImageNet。
 - 部分執行期間顯示卡同時在跑其他程式，且後半批次在 Colab Tesla T4 上以 fp16 執行，所以執行時間只能大略參考。
 
@@ -244,4 +244,4 @@ uv run python examples/sort_report.py runs/sort_ablation.jsonl --lang zh --plot 
 - `cifar_netaug.py` 的主要選項：`--width`（base 寬度倍數）、`--depth`、`--init {base,max}`、`--stop-aug`、`--sort-every`、`--granularity {group,global}`、`--grad-log-every N`、`--amp {bf16,fp16,off}`、`--warmup N`。
 - `sort_report.py` 把第 4.7 節的結果表印到標準輸出（`--lang en` 產生英文表頭），`--plot` 寫出 `sort_ablation.png`。
 - `examples/run_cifar100_regime.sh` 是較早的 CIFAR-100 對照腳本，本文件沒有使用它的結果。
-- MobileNetV2：`uv run python examples/cifar_netaug.py --model {mbv2_035,mbv2_050} --method {baseline,netaug} --dataset cifar100 --epochs 40 --seed 0 --eval-widths 1.0 2.0 3.0 --out <檔案>`，可加 `--warmup 5`、`--grad-log-every 20`、`--alpha 0` 或 `--lr 0.05 --wd 1e-3`。
+- MobileNetV2：`uv run python examples/cifar_netaug.py --model {mbv2_035,mbv2_050} --method {baseline,netaug} --dataset cifar100 --epochs 40 --seed {0,1,2} --eval-widths 1.0 2.0 3.0 --out <檔案>`，可加 `--warmup 5`、`--grad-log-every 20`、`--alpha 0` 或 `--lr 0.05 --wd 1e-3`。
