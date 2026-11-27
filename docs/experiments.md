@@ -2,14 +2,14 @@
 
 **繁體中文** | [English](experiments.en.md)
 
-日期：2026-11-19（CIFAR-10）、2026-11-23–24（CIFAR-100）；排序消融（第 4.7 節）執行中。程式設計與正確性驗證見 [design.md](design.md)，專案總結見 [summary.md](../summary.md)，術語見 [glossary.md](glossary.md)。
+日期：2026-11-19（CIFAR-10）、2026-11-23–24（CIFAR-100）、2026-11-27（排序消融，第 4.7 節）。程式設計與正確性驗證見 [design.md](design.md)，專案總結見 [summary.md](../summary.md)，術語見 [glossary.md](glossary.md)。
 
 ## 1. 重點
 
 1. **NetAug 沒有顯著提高 base 模型的測試準確率。** CIFAR-10 的增益在 +0.34 個百分點以內，小於 seed 雜訊。CIFAR-100（每種設定 8 個 seed）沒有任何 NetAug 設定的 95% 信賴區間下限大於 0。
 2. **baseline 多訓練 40 epoch 有顯著增益**：+1.54 個百分點（95% CI [+0.85, +2.24]）。它的計算量約為 2 倍，仍少於本環境中 NetAug 的 2.6 倍。
-3. **訓練準確率上升，測試準確率沒有**（CIFAR-10 每個 seed +0.7 到 +1.3 個百分點；CIFAR-100 ×1 平均 +1.16 個百分點）。深度增強、通道排序與官方實作的配方選項都沒有改變結果。
-4. **匯出的寬模型比同寬度單獨訓練的模型低 1.3 到 20.5 個百分點。** MobileNetV2（1 個 seed）在 NetAug 下更差，原因未確定。
+3. **訓練準確率上升，測試準確率沒有**（CIFAR-10 每個 seed +0.7 到 +1.3 個百分點；CIFAR-100 ×1 平均 +1.16 個百分點）。深度增強、通道排序與官方實作的配方選項都沒有改變結果（MobileNetV2 上排序在每個 seed 都減少了 NetAug 的損失，但仍低於 baseline，見第 4.7 節）。
+4. **匯出的寬模型比同寬度單獨訓練的模型低 1.3 到 20.5 個百分點。** MobileNetV2 在 NetAug 下更差（3 個 seed 都低於 baseline），原因未確定。
 5. **沒有找到實作錯誤。** 所有匯出模型與動態模型的輸出差異都是 0。
 
 ```mermaid
@@ -24,7 +24,7 @@ flowchart LR
 | 項目 | 設定 |
 |---|---|
 | 程式碼 | 分支 `feat/torchnetaug`：CIFAR-10 寬度 `941b37a`、深度 `83e5073`、CIFAR-100 `f81bdfc`、排序消融 `13a9f0e` |
-| 環境 | Python 3.14.3、PyTorch 2.11.0+cu128、Windows 10、RTX 3060 Ti 8 GB（bf16）；Colab Tesla T4 15 GB（CIFAR-100 補齊至 8 個 seed 的後半批次與排序消融，fp16） |
+| 環境 | Python 3.14.3、PyTorch 2.11.0+cu128、Windows 10、RTX 3060 Ti 8 GB（bf16）；Colab Tesla T4 15 GB（CIFAR-100 補齊至 8 個 seed 的後半批次，fp16） |
 | 模型 | TinyResNet：CIFAR 版 ResNet-18，寬度 1/8（8、16、32、64 通道，176,402 個參數）；`--width` 再乘上 base 寬度倍數 |
 | 訓練 | 40 epoch、batch 128、Nesterov SGD（momentum 0.9）、lr 0.1 cosine、weight decay 5e-4（BN 與 bias 不做）、隨機裁切與水平翻轉、16-bit autocast（3060 Ti 用 bf16，T4 用 fp16） |
 | NetAug | `width_mults=(1.0, 2.0, 3.0)`、`alpha=1.0`、每個通道群組各自抽寬度、全程增強 |
@@ -152,13 +152,14 @@ CIFAR-10 的效果很小。本節檢查原因：設定不適合、實作有問�
 - 10 epoch 的排除實驗：NetAug lr 0.05 是 18.2%，NetAug α=0 是 19.6%，baseline lr 0.2 加 weight decay 2.5e-4 是 20.8%。所以包裝器的 forward 不是原因，單純加倍步長也不會讓 baseline 變差；問題在增強 loss 的梯度。
 - 新增通道改用 fan-out 初始化更差（10 epoch 10.0%），已撤回。warmup 讓第一個 epoch 的長度比降到 1.2，但 cosine 仍只有 0.12，NetAug 仍低 4.1 個百分點。
 - 這個模型不適合直接下結論：總步幅 32 讓 32×32 輸入最後只剩 1×1，baseline 只有 41.6%。寬度仍有幫助：寬度 0.5 單獨訓練是 45.02%（81.6 萬個參數）。
+- 3 個 seed 的 40 epoch 結果見第 4.7 節：baseline 41.08% 到 41.81%，NetAug（不排序）13.46% 到 36.50%。
 - 原始資料在 `runs/diag/mbv2_default_init/`。
 
-### 4.7 排序消融（1 個 seed，執行中）
+### 4.7 排序消融（3 個 seed）
 
 本節檢查通道排序的三個選擇是否影響訓練結果：排序範圍、重要度的合計方式，以及排序時怎麼處理 optimizer 狀態。官方實作只排序 inner 群組、重要度只用一個讀取者，而且排序時不重排動量。本套件預設排序所有可增強群組、加總所有 dense 讀取者的重要度，並重排 optimizer 狀態。差異見 [official_diff.md](official_diff.md)，排序的設計見 [design.md 第 5 節](design.md#5-通道排序)。
 
-每個設定只改變一個因素，參考設定是 `all`。除了 `none`，所有設定都每個 epoch 排序一次（`--sort-every 1`）。實驗用 CIFAR-100、40 epoch、seed 0，模型是 MobileNetV2（`mbv2_035`）與 TinyResNet（`resnet_tiny`），共 15 次執行。`resnet_tiny` 沒有 closed 群組，`closed` 會等於 `inner`，所以不執行。
+每個設定只改變一個因素，參考設定是 `all`。除了 `none`，所有設定都每個 epoch 排序一次（`--sort-every 1`）。實驗用 CIFAR-100、40 epoch、seed 0、1、2，模型是 MobileNetV2（`mbv2_035`）與 TinyResNet（`resnet_tiny`），共 45 次執行，全部在 RTX 3060 Ti 上以 bf16 執行。`resnet_tiny` 沒有 closed 群組，`closed` 會等於 `inner`，所以不執行。
 
 | 設定 | 選項 | 檢查什麼 |
 |---|---|---|
@@ -178,9 +179,38 @@ CIFAR-10 的效果很小。本節檢查原因：設定不適合、實作有問�
 - 移入 base 的通道數（`moved_into_base`）：排序後在 base 寬度內、排序前在 base 寬度外的通道。
 - 最大寬度網路在 500 張測試影像上的輸出最大變化（`max_abs_diff`，對照最大 logit `max_abs_logit`）。排序應保持函數不變，所以這個值應接近 0。
 
-結果待補：實驗在 Colab 上等待 GPU 額度。結果表與圖 `figures/sort_ablation.png` 由 `examples/sort_report.py` 產生（見第 6 節）。
+結果由 `examples/sort_report.py` 產生（見第 6 節），判讀規則同第 4.1 節。
 
-只有 1 個 seed，所以小於約 0.5 個百分點的差異無法和 seed 雜訊區分（見第 5 節）。
+CIFAR-100，40 epoch，seed 0, 1, 2。
+數值是 3 個 seed 的平均；差異是同 seed 配對相減後的平均與 95% 信賴區間（t 分布）。
+
+| 模型 | 設定 | n | test acc (%) | 對 all（百分點） | 對 none（百分點） | 匯出 ×1.5 | 匯出 ×2 | 匯出 ×2.5 | 匯出 ×3 | 排序次數 | 每次排序改變順序的群組 | 每次排序與預設排序不同的群組 | 移入 base 的通道（全部排序合計） | 最大寬度輸出的最大變化 | 分鐘 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mbv2_035 | `none` | 3 | 26.01 | −7.11 [−19.67, +5.44] | — | 26.58 | 27.71 | 27.82 | 27.97 | 0 | — | — | — | — | 10.2 |
+| mbv2_035 | `inner` | 3 | 30.78 | −2.34 [−4.43, −0.25] | +4.78 [−8.88, +18.43] | 31.04 | 31.98 | 32.31 | 32.29 | 39 | 16 / 16 | 9 | 1222.7 | 4.3e-04 | 9.9 |
+| mbv2_035 | `closed` | 3 | 33.18 | +0.06 [−5.20, +5.32] | +7.17 [−4.93, +19.28] | 33.41 | 33.93 | 34.14 | 34.03 | 39 | 19.8 / 20 | 5 | 3824.3 | 9.8e-04 | 9.9 |
+| mbv2_035 | `all` | 3 | 33.12 | — | +7.11 [−5.44, +19.67] | 33.53 | 33.79 | 33.96 | 33.87 | 39 | 24.4 / 25 | 0 | 3544.7 | 1.3e-03 | 10.2 |
+| mbv2_035 | `all-mean` | 3 | 33.10 | −0.02 [−0.08, +0.03] | +7.09 [−5.43, +19.61] | 33.48 | 33.83 | 33.92 | 33.98 | 39 | 24.4 / 25 | 0.1 | 3584.7 | 1.3e-03 | 9.7 |
+| mbv2_035 | `all-single` | 3 | 32.41 | −0.71 [−4.89, +3.47] | +6.41 [−6.03, +18.84] | 33.05 | 33.14 | 33.18 | 33.23 | 39 | 24.5 / 25 | 5 | 3854.3 | 7.9e-03 | 10.3 |
+| mbv2_035 | `all-keep` | 3 | 33.04 | −0.08 [−2.79, +2.62] | +7.03 [−8.01, +22.07] | 33.45 | 34.00 | 34.12 | 34.21 | 39 | 24.4 / 25 | 0 | 3660.3 | 1.2e-03 | 10.2 |
+| mbv2_035 | `all-rebuild` | 3 | 31.64 | −1.48 [−5.92, +2.96] | +5.63 [−11.11, +22.37] | 32.10 | 32.46 | 32.53 | 32.49 | 39 | 24.3 / 25 | 0 | 3590 | 9.9e-04 | 10.2 |
+| resnet_tiny | `none` | 3 | 59.80 | +0.09 [−0.42, +0.60] | — | 60.53 | 62.54 | 62.84 | 63.10 | 0 | — | — | — | — | 5.3 |
+| resnet_tiny | `inner` | 3 | 59.65 | −0.06 [−0.91, +0.79] | −0.15 [−0.55, +0.24] | 60.79 | 62.71 | 62.86 | 63.11 | 39 | 7.8 / 8 | 4 | 0.7 | 2.3e-05 | 5.4 |
+| resnet_tiny | `all` | 3 | 59.71 | — | −0.09 [−0.60, +0.42] | 61.03 | 62.53 | 62.84 | 62.99 | 39 | 11.6 / 12 | 0 | 0 | 4.6e-05 | 5.3 |
+| resnet_tiny | `all-mean` | 3 | 58.77 | −0.93 [−2.56, +0.69] | −1.03 [−2.78, +0.73] | 60.38 | 62.30 | 62.75 | 62.86 | 39 | 11.7 / 12 | 4 | 0.3 | 6.1e-05 | 5.2 |
+| resnet_tiny | `all-single` | 3 | 59.92 | +0.22 [−1.22, +1.66] | +0.12 [−1.60, +1.85] | 60.73 | 62.44 | 62.76 | 62.97 | 39 | 11.6 / 12 | 4 | 1 | 6.1e-05 | 5.1 |
+| resnet_tiny | `all-keep` | 3 | 58.27 | −1.43 [−4.89, +2.02] | −1.53 [−5.46, +2.40] | 59.65 | 61.30 | 61.72 | 61.75 | 39 | 11.6 / 12 | 0 | 0 | 6.1e-05 | 5.3 |
+| resnet_tiny | `all-rebuild` | 3 | 58.40 | −1.31 [−3.53, +0.92] | −1.40 [−3.70, +0.90] | 59.83 | 61.33 | 61.78 | 62.00 | 39 | 11.6 / 12 | 0 | 0.7 | 9.2e-05 | 5.4 |
+
+![排序消融](figures/sort_ablation.png)
+
+觀察：
+
+1. **MobileNetV2 上，NetAug 的結果在 seed 之間差很多，排序減少了損失。** 不排序時 3 個 seed 是 36.50%、28.06%、13.46%；同 seed 的 baseline 是 41.61%、41.81%、41.08%（seed 1、2 另外執行，結果在 `runs/sort_ablation_baseline.jsonl`）。`all` 在每個 seed 都比 `none` 高（+3.41、+5.06、+12.87 個百分點），但仍比 baseline 低 1.70 到 14.75 個百分點。信賴區間跨過 0，所以「排序對 MobileNetV2 有增益」判讀為無法判定。
+2. **MobileNetV2 上，官方實作的排序範圍（`inner`）比 `all` 差**：−2.34 [−4.43, −0.25]，3 個 seed 都是負的（−1.96、−3.30、−1.75）。`closed` 和 `all` 沒有可分辨的差異。
+3. **TinyResNet 上，排序沒有實質增益**：`all` 對 `none` 是 −0.09 [−0.60, +0.42]，`inner` 對 `none` 是 −0.15 [−0.55, +0.24]，上限都小於 +0.5。
+4. **重要度的合計方式與 optimizer 狀態的處理沒有可分辨的效果。** MobileNetV2 上 `all-mean` 幾乎選出和 `all` 相同的排列（每次排序平均 0.1 個群組不同），差異 −0.02 [−0.08, +0.03]。其他設定的平均差異在 −1.48 到 +0.22 個百分點之間，信賴區間都跨過 0。
+5. **排序保持函數不變，但兩個模型移入 base 的通道數差很多。** 最大寬度輸出的最大變化相對於最大 logit：TinyResNet 在 7e-7 以內，MobileNetV2 在 7.4e-4 以內（7.9e-3 對 logit 10.8，原因未檢查）。TinyResNet 每個執行的 39 次排序合計只移入 0 到 2 個通道（與第 3.2、4.5 節一致），MobileNetV2 合計移入 931 到 4,500 個通道。排序只在 MobileNetV2 上有明顯影響，可能和這個差別有關（未證實）。
 
 ### 4.8 可能的原因（未證實）
 
@@ -188,7 +218,7 @@ CIFAR-10 的效果很小。本節檢查原因：設定不適合、實作有問�
 
 ## 5. 限制
 
-- CIFAR-10 每種設定只有 3 個 seed；CIFAR-100 每種設定 8 個 seed；MobileNetV2 與排序消融只有 1 個 seed。小於約 0.5 個百分點的差異無法和 seed 雜訊區分。
+- CIFAR-10 每種設定只有 3 個 seed；CIFAR-100 每種設定 8 個 seed；MobileNetV2 的第 4.6 節只有 1 個 seed，排序消融只有 3 個 seed。小於約 0.5 個百分點的差異無法和 seed 雜訊區分。
 - 只用 40 epoch（對照組 80 epoch）、32×32 影像與兩種架構，沒有測 ImageNet。
 - 部分執行期間顯示卡同時在跑其他程式，且後半批次在 Colab Tesla T4 上以 fp16 執行，所以執行時間只能大略參考。
 
@@ -206,7 +236,7 @@ bash examples/run_diagnosis.sh                         # 第 4 節（全部 7 �
 uv run python examples/summarize.py --ref-epochs 40 runs/diag/method_*.jsonl
 uv run python examples/plot_results.py --out runs/plots --ref-epochs 40 runs/diag/method_*.jsonl
 
-uv run python examples/sort_ablation.py --seeds 0      # 第 4.7 節（15 次執行，結果在 runs/sort_ablation.jsonl）
+uv run python examples/sort_ablation.py --amp bf16     # 第 4.7 節（45 次執行，結果在 runs/sort_ablation.jsonl）
 uv run python examples/sort_report.py runs/sort_ablation.jsonl --lang zh --plot docs/figures
 ```
 

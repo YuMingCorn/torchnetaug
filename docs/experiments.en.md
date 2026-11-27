@@ -2,14 +2,14 @@
 
 [繁體中文](experiments.md) | **English**
 
-Dates: 2026-11-19 (CIFAR-10), 2026-11-23–24 (CIFAR-100); the sorting ablation (Section 4.7) is in progress. For the code design and correctness verification, see [design.en.md](design.en.md). For the project summary, see [summary.en.md](../summary.en.md). For terms, see [glossary.md](glossary.md).
+Dates: 2026-11-19 (CIFAR-10), 2026-11-23–24 (CIFAR-100), 2026-11-27 (sorting ablation, Section 4.7). For the code design and correctness verification, see [design.en.md](design.en.md). For the project summary, see [summary.en.md](../summary.en.md). For terms, see [glossary.md](glossary.md).
 
 ## 1. Key points
 
 1. **NetAug did not significantly improve the test accuracy of the base model.** On CIFAR-10 the gain is at most +0.34 percentage points, smaller than the seed noise. On CIFAR-100 (8 seeds per setting), no NetAug setting has a 95% confidence interval with a lower bound above 0.
 2. **A baseline trained for 40 more epochs gives a significant gain**: +1.54 percentage points (95% CI [+0.85, +2.24]). It uses about 2 times the compute, still less than the 2.6 times of NetAug in this environment.
-3. **The training accuracy goes up, but the test accuracy does not** (+0.7 to +1.3 percentage points per seed on CIFAR-10; +1.16 percentage points on average at CIFAR-100 ×1). Depth augmentation, channel sorting and the recipe options of the official implementation did not change the result.
-4. **Exported wide models are 1.3 to 20.5 percentage points below models of the same width trained alone.** MobileNetV2 (1 seed) is worse with NetAug. The cause is not known.
+3. **The training accuracy goes up, but the test accuracy does not** (+0.7 to +1.3 percentage points per seed on CIFAR-10; +1.16 percentage points on average at CIFAR-100 ×1). Depth augmentation, channel sorting and the recipe options of the official implementation did not change the result (on MobileNetV2, sorting reduced the loss from NetAug in every seed, but NetAug stayed below the baseline; see Section 4.7).
+4. **Exported wide models are 1.3 to 20.5 percentage points below models of the same width trained alone.** MobileNetV2 is worse with NetAug (below the baseline in all 3 seeds). The cause is not known.
 5. **No implementation error was found.** For all exported models, the output difference from the dynamic model is 0.
 
 ```mermaid
@@ -24,7 +24,7 @@ flowchart LR
 | Item | Setting |
 |---|---|
 | Code | Branch `feat/torchnetaug`: CIFAR-10 width `941b37a`, depth `83e5073`, CIFAR-100 `f81bdfc`, sorting ablation `13a9f0e` |
-| Environment | Python 3.14.3, PyTorch 2.11.0+cu128, Windows 10, RTX 3060 Ti 8 GB (bf16); Colab Tesla T4 15 GB (second batch completing 8 seeds on CIFAR-100, and the sorting ablation, fp16) |
+| Environment | Python 3.14.3, PyTorch 2.11.0+cu128, Windows 10, RTX 3060 Ti 8 GB (bf16); Colab Tesla T4 15 GB (second batch completing 8 seeds on CIFAR-100, fp16) |
 | Model | TinyResNet: CIFAR ResNet-18 at 1/8 width (8, 16, 32, 64 channels, 176,402 parameters); `--width` multiplies this by a base width multiplier |
 | Training | 40 epochs, batch 128, Nesterov SGD (momentum 0.9), lr 0.1 cosine, weight decay 5e-4 (not on BN and bias), random crop and horizontal flip, 16-bit autocast (bf16 on 3060 Ti, fp16 on T4) |
 | NetAug | `width_mults=(1.0, 2.0, 3.0)`, `alpha=1.0`, each channel group samples its own width, augmentation for the whole run |
@@ -152,13 +152,14 @@ The gains of the paper come from MobileNet-class models, so torchvision MobileNe
 - 10-epoch ablations: NetAug with lr 0.05 gives 18.2%, NetAug with α=0 gives 19.6%, and the baseline with lr 0.2 and weight decay 2.5e-4 gives 20.8%. So the forward pass of the wrapper is not the cause, and doubling the step size alone does not make the baseline worse; the problem is in the gradient of the augmented loss.
 - A fan-out initialization of the added channels was worse (10 epochs: 10.0%) and was withdrawn. Warmup lowers the length ratio of the first epoch to 1.2, but the cosine is still only 0.12, and NetAug is still 4.1 percentage points lower.
 - This model is not suitable for a direct conclusion: the total stride is 32, so a 32×32 input becomes 1×1 at the end, and the baseline reaches only 41.6%. Width still helps: width 0.5 trained alone gives 45.02% (816,000 parameters).
+- For 40-epoch results with 3 seeds, see Section 4.7: baseline 41.08% to 41.81%, NetAug (no sorting) 13.46% to 36.50%.
 - The raw data is in `runs/diag/mbv2_default_init/`.
 
-### 4.7 Sorting ablation (1 seed, in progress)
+### 4.7 Sorting ablation (3 seeds)
 
 This section checks whether three choices of channel sorting change the training result: the sort scope, how the importance is combined, and what happens to the optimizer state at a sort. The official implementation sorts only inner groups, uses the importance of one reader, and does not permute the momentum at a sort. By default this package sorts every free group, sums the importance of all dense readers, and permutes the optimizer state. For the differences, see [official_diff.en.md](official_diff.en.md). For the design of sorting, see [Section 5 of design.en.md](design.en.md#5-channel-sorting).
 
-Each setting changes one factor, and the reference setting is `all`. Every setting except `none` sorts once per epoch (`--sort-every 1`). The experiment uses CIFAR-100, 40 epochs and seed 0, with MobileNetV2 (`mbv2_035`) and TinyResNet (`resnet_tiny`): 15 runs in total. `resnet_tiny` has no closed groups, so `closed` would equal `inner` and is not run.
+Each setting changes one factor, and the reference setting is `all`. Every setting except `none` sorts once per epoch (`--sort-every 1`). The experiment uses CIFAR-100, 40 epochs and seeds 0, 1 and 2, with MobileNetV2 (`mbv2_035`) and TinyResNet (`resnet_tiny`): 45 runs in total, all in bf16 on the RTX 3060 Ti. `resnet_tiny` has no closed groups, so `closed` would equal `inner` and is not run.
 
 | Setting | Options | What it tests |
 |---|---|---|
@@ -178,9 +179,38 @@ Each sort records these values in `sort_log` of the jsonl file:
 - The number of channels moved into the base (`moved_into_base`): channels inside the base width after the sort that were outside it before.
 - The largest change of the max-width network output on 500 test images (`max_abs_diff`, next to the largest logit `max_abs_logit`). A sort must keep the function the same, so this value must be close to 0.
 
-Results to be added: the experiment is waiting for GPU quota on Colab. `examples/sort_report.py` writes the results table and the figure `figures/sort_ablation.png` (see Section 6).
+`examples/sort_report.py` writes the results (see Section 6). The decision rule is the one of Section 4.1.
 
-There is only 1 seed, so differences smaller than about 0.5 percentage points cannot be told apart from seed noise (see Section 5).
+CIFAR-100, 40 epochs, seed 0, 1, 2.
+Values are means over 3 seeds; differences are means of the per-seed paired differences, with the 95% confidence interval (t distribution).
+
+| model | setting | n | test acc (%) | vs all (points) | vs none (points) | exported ×1.5 | exported ×2 | exported ×2.5 | exported ×3 | sorts | groups reordered per sort | groups different from the default sort, per sort | channels moved into base (all sorts) | max change of the max-width output | minutes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mbv2_035 | `none` | 3 | 26.01 | −7.11 [−19.67, +5.44] | — | 26.58 | 27.71 | 27.82 | 27.97 | 0 | — | — | — | — | 10.2 |
+| mbv2_035 | `inner` | 3 | 30.78 | −2.34 [−4.43, −0.25] | +4.78 [−8.88, +18.43] | 31.04 | 31.98 | 32.31 | 32.29 | 39 | 16 / 16 | 9 | 1222.7 | 4.3e-04 | 9.9 |
+| mbv2_035 | `closed` | 3 | 33.18 | +0.06 [−5.20, +5.32] | +7.17 [−4.93, +19.28] | 33.41 | 33.93 | 34.14 | 34.03 | 39 | 19.8 / 20 | 5 | 3824.3 | 9.8e-04 | 9.9 |
+| mbv2_035 | `all` | 3 | 33.12 | — | +7.11 [−5.44, +19.67] | 33.53 | 33.79 | 33.96 | 33.87 | 39 | 24.4 / 25 | 0 | 3544.7 | 1.3e-03 | 10.2 |
+| mbv2_035 | `all-mean` | 3 | 33.10 | −0.02 [−0.08, +0.03] | +7.09 [−5.43, +19.61] | 33.48 | 33.83 | 33.92 | 33.98 | 39 | 24.4 / 25 | 0.1 | 3584.7 | 1.3e-03 | 9.7 |
+| mbv2_035 | `all-single` | 3 | 32.41 | −0.71 [−4.89, +3.47] | +6.41 [−6.03, +18.84] | 33.05 | 33.14 | 33.18 | 33.23 | 39 | 24.5 / 25 | 5 | 3854.3 | 7.9e-03 | 10.3 |
+| mbv2_035 | `all-keep` | 3 | 33.04 | −0.08 [−2.79, +2.62] | +7.03 [−8.01, +22.07] | 33.45 | 34.00 | 34.12 | 34.21 | 39 | 24.4 / 25 | 0 | 3660.3 | 1.2e-03 | 10.2 |
+| mbv2_035 | `all-rebuild` | 3 | 31.64 | −1.48 [−5.92, +2.96] | +5.63 [−11.11, +22.37] | 32.10 | 32.46 | 32.53 | 32.49 | 39 | 24.3 / 25 | 0 | 3590 | 9.9e-04 | 10.2 |
+| resnet_tiny | `none` | 3 | 59.80 | +0.09 [−0.42, +0.60] | — | 60.53 | 62.54 | 62.84 | 63.10 | 0 | — | — | — | — | 5.3 |
+| resnet_tiny | `inner` | 3 | 59.65 | −0.06 [−0.91, +0.79] | −0.15 [−0.55, +0.24] | 60.79 | 62.71 | 62.86 | 63.11 | 39 | 7.8 / 8 | 4 | 0.7 | 2.3e-05 | 5.4 |
+| resnet_tiny | `all` | 3 | 59.71 | — | −0.09 [−0.60, +0.42] | 61.03 | 62.53 | 62.84 | 62.99 | 39 | 11.6 / 12 | 0 | 0 | 4.6e-05 | 5.3 |
+| resnet_tiny | `all-mean` | 3 | 58.77 | −0.93 [−2.56, +0.69] | −1.03 [−2.78, +0.73] | 60.38 | 62.30 | 62.75 | 62.86 | 39 | 11.7 / 12 | 4 | 0.3 | 6.1e-05 | 5.2 |
+| resnet_tiny | `all-single` | 3 | 59.92 | +0.22 [−1.22, +1.66] | +0.12 [−1.60, +1.85] | 60.73 | 62.44 | 62.76 | 62.97 | 39 | 11.6 / 12 | 4 | 1 | 6.1e-05 | 5.1 |
+| resnet_tiny | `all-keep` | 3 | 58.27 | −1.43 [−4.89, +2.02] | −1.53 [−5.46, +2.40] | 59.65 | 61.30 | 61.72 | 61.75 | 39 | 11.6 / 12 | 0 | 0 | 6.1e-05 | 5.3 |
+| resnet_tiny | `all-rebuild` | 3 | 58.40 | −1.31 [−3.53, +0.92] | −1.40 [−3.70, +0.90] | 59.83 | 61.33 | 61.78 | 62.00 | 39 | 11.6 / 12 | 0 | 0.7 | 9.2e-05 | 5.4 |
+
+![Sorting ablation](figures/sort_ablation.png)
+
+Observations:
+
+1. **On MobileNetV2, the NetAug result changes a lot from seed to seed, and sorting reduces the loss.** Without sorting, the 3 seeds give 36.50%, 28.06% and 13.46%. The baseline with the same seeds gives 41.61%, 41.81% and 41.08% (seeds 1 and 2 were run separately, results in `runs/sort_ablation_baseline.jsonl`). `all` is above `none` in every seed (+3.41, +5.06 and +12.87 percentage points), but still 1.70 to 14.75 percentage points below the baseline. The confidence interval includes 0, so "sorting helps MobileNetV2" is undecided.
+2. **On MobileNetV2, the sort scope of the official implementation (`inner`) is worse than `all`**: −2.34 [−4.43, −0.25], negative in all 3 seeds (−1.96, −3.30 and −1.75). `closed` and `all` show no measurable difference.
+3. **On TinyResNet, sorting gives no real gain**: `all` against `none` is −0.09 [−0.60, +0.42], and `inner` against `none` is −0.15 [−0.55, +0.24]. Both upper bounds are below +0.5.
+4. **How the importance is combined and what happens to the optimizer state have no measurable effect.** On MobileNetV2, `all-mean` chooses almost the same permutation as `all` (0.1 groups different per sort on average); the difference is −0.02 [−0.08, +0.03]. The other settings have mean differences from −1.48 to +0.22 percentage points, and all their confidence intervals include 0.
+5. **Sorting keeps the function the same, but the two models move very different numbers of channels into the base.** The largest change of the max-width output, relative to the largest logit, is at most 7e-7 for TinyResNet and at most 7.4e-4 for MobileNetV2 (7.9e-3 against a logit of 10.8; the cause was not checked). On TinyResNet, the 39 sorts of a run move 0 to 2 channels into the base in total (as in Sections 3.2 and 4.5); on MobileNetV2 they move 931 to 4,500 channels. This difference may be why sorting has a clear effect only on MobileNetV2 (not proven).
 
 ### 4.8 Possible causes (not proven)
 
@@ -188,7 +218,7 @@ The gains of the paper come from MobileNet-class models on ImageNet, where augme
 
 ## 5. Limitations
 
-- CIFAR-10 has only 3 seeds per setting; CIFAR-100 has 8 seeds per setting; MobileNetV2 and the sorting ablation have only 1 seed. Differences smaller than about 0.5 percentage points cannot be told apart from seed noise.
+- CIFAR-10 has only 3 seeds per setting; CIFAR-100 has 8 seeds per setting; Section 4.6 (MobileNetV2) has only 1 seed, and the sorting ablation has only 3 seeds. Differences smaller than about 0.5 percentage points cannot be told apart from seed noise.
 - Only 40 epochs (80 for a control), 32×32 images and two architectures were used. ImageNet was not tested.
 - During some runs the GPU was also running other programs, and the second batch ran in fp16 on a Colab Tesla T4, so the run times are only approximate.
 
@@ -206,7 +236,7 @@ bash examples/run_diagnosis.sh                         # Section 4 (all 7 stages
 uv run python examples/summarize.py --ref-epochs 40 runs/diag/method_*.jsonl
 uv run python examples/plot_results.py --out runs/plots --ref-epochs 40 runs/diag/method_*.jsonl
 
-uv run python examples/sort_ablation.py --seeds 0      # Section 4.7 (15 runs, results in runs/sort_ablation.jsonl)
+uv run python examples/sort_ablation.py --amp bf16     # Section 4.7 (45 runs, results in runs/sort_ablation.jsonl)
 uv run python examples/sort_report.py runs/sort_ablation.jsonl --lang en --plot docs/figures
 ```
 

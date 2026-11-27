@@ -3,7 +3,8 @@
     uv run python examples/sort_report.py [--lang {zh,en}] [--plot DIR] [results.jsonl ...]
 
 Prints one Markdown table to stdout, one row per (model, setting): test accuracy, the
-difference against ``all`` and against ``none`` (paired by seed, percentage points), the
+difference against ``all`` and against ``none`` (paired by seed, percentage points, with the
+95% confidence interval when there is more than one seed), the
 accuracy of each exported wider model, and what the sort log recorded (number of sorts,
 groups whose order changed, groups that differ from the default sort, channels moved into
 the base model, and the largest change of the max-width output). With more than one seed,
@@ -48,7 +49,7 @@ HEADERS = {
         "out": "最大寬度輸出的最大變化",
         "minutes": "分鐘",
         "caption": "{ds}，{ep} epoch，seed {seeds}。",
-        "mean": "數值是 {n} 個 seed 的平均；差異是同 seed 配對相減後的平均。",
+        "mean": "數值是 {n} 個 seed 的平均；差異是同 seed 配對相減後的平均與 95% 信賴區間（t 分布）。",
     },
     "en": {
         "model": "model",
@@ -65,7 +66,7 @@ HEADERS = {
         "out": "max change of the max-width output",
         "minutes": "minutes",
         "caption": "{ds}, {ep} epochs, seed {seeds}.",
-        "mean": "Values are means over {n} seeds; differences are means of the per-seed paired differences.",
+        "mean": "Values are means over {n} seeds; differences are means of the per-seed paired differences, with the 95% confidence interval (t distribution).",
     },
 }
 DATASETS = {"cifar10": "CIFAR-10", "cifar100": "CIFAR-100"}
@@ -179,7 +180,12 @@ def table(groups: dict, lang: str) -> str:
             cells.append(f"{statistics.mean(r['test_acc'] for r in rs) * 100:.2f}")
             for ref in (REF, NONE):
                 d = None if setting == ref else paired_diff(rs, by_setting.get(ref, []))
-                cells.append("—" if d is None else signed(d[0]))
+                if d is None:
+                    cells.append("—")
+                elif many and not math.isnan(d[1]):
+                    cells.append(f"{signed(d[0])} [{signed(d[0] - d[1])}, {signed(d[0] + d[1])}]")
+                else:
+                    cells.append(signed(d[0]))
             for w in widths:
                 vals = [
                     r["width_acc"][w].get("export_test_acc", r["width_acc"][w]["test_acc"])
@@ -198,7 +204,7 @@ def table(groups: dict, lang: str) -> str:
                 for r in logged
                 if all("moved_into_base" in e for e in r["sort_log"])
             ]
-            cells.append(f"{statistics.mean(moved):g}" if moved else "—")
+            cells.append(short(statistics.mean(moved)) if moved else "—")
             outs = [e["max_abs_diff"] for r in logged for e in r["sort_log"] if "max_abs_diff" in e]
             cells.append(f"{max(outs):.1e}" if outs else "—")
             cells.append(f"{statistics.mean(r['minutes'] for r in rs):.1f}")
