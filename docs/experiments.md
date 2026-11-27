@@ -210,7 +210,7 @@ CIFAR-100，40 epoch，seed 0, 1, 2。
 2. **MobileNetV2 上，官方實作的排序範圍（`inner`）比 `all` 差**：−2.34 [−4.43, −0.25]，3 個 seed 都是負的（−1.96、−3.30、−1.75）。這是對 `all` 的 13 個比較之一，沒有做多重比較校正。`closed` 對 `all` 是 +0.06 [−5.20, +5.32]，判讀為無法判定。
 3. **TinyResNet 上，排序沒有實質增益**：`all` 對 `none` 是 −0.09 [−0.60, +0.42]，`inner` 對 `none` 是 −0.15 [−0.55, +0.24]，上限都小於 +0.5。其他設定對 `none` 都是無法判定。
 4. **重要度的合計方式與 optimizer 狀態的處理，只有 `all-mean`（MobileNetV2）可以判讀。** 它幾乎選出和 `all` 相同的排列（每次排序平均 0.1 個群組不同），差異 −0.02 [−0.08, +0.03]，沒有實質差異。其他設定都是無法判定（信賴區間寬 2.9 到 8.9 個百分點）。TinyResNet 上 `all-mean`、`all-keep`、`all-rebuild` 在 3 個 seed 都低於 `all`；`all-keep` 與 `all-rebuild` 匯出的各寬度也低 1.0 到 1.4 個百分點。
-5. **排序保持函數不變。** 最大寬度輸出的最大變化相對於最大 logit：TinyResNet 在 6.7e-7 以內，MobileNetV2 在 7.3e-4 以內（7.9e-3 對 logit 10.8）。MobileNetV2 的值較大，所以另外用 float64 重算（`runs/diag/sort_fp64/`）：重跑 10 epoch（`all-single`、seed 2），每次排序前後的輸出差異在 float64 下是 7.4e-14 以內，同一次排序在 float32 下是 2e-6 到 1.4e-4。所以這是 float32 的捨入誤差被網路放大，不是排序改變了函數。移入 base 的通道數差很多：TinyResNet 每個執行的 39 次排序合計 0 到 2 個（與第 3.2、4.5 節一致），MobileNetV2 是 931 到 4,500 個。這可能是只有 MobileNetV2 的結果隨排序明顯變化的原因（未證實）。
+5. **排序保持函數不變。** 最大寬度輸出的最大變化相對於最大 logit：TinyResNet 在 6.7e-7 以內，MobileNetV2 在 7.3e-4 以內（7.9e-3 對 logit 10.8）。MobileNetV2 的值較大，所以另外用 float64 重算（`runs/diag/sort_fp64/`）：用相同設定重跑 `all-single`、seed 2，直到第 7 epoch 的排序（就是 7.9e-3 的那一次；排序前的最大 logit 與原紀錄相同，表示重現了同一個模型）。這次排序前後的輸出差異在 float64 下是 2.6e-13，前 7 次排序都在 5.6e-12 以內。所以這是 float32 的捨入誤差被網路放大，不是排序改變了函數。移入 base 的通道數差很多：TinyResNet 每個執行的 39 次排序合計 0 到 2 個（與第 3.2、4.5 節一致），MobileNetV2 是 931 到 4,500 個。這可能是只有 MobileNetV2 的結果隨排序明顯變化的原因（未證實）。
 
 ### 4.8 可能的原因（未證實）
 
