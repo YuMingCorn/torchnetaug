@@ -206,11 +206,11 @@ CIFAR-100，40 epoch，seed 0, 1, 2。
 
 觀察：
 
-1. **MobileNetV2 上，NetAug 的結果在 seed 之間差很多；這 3 個 seed 中，排序都減少了損失。** 不排序時是 36.50%、28.06%、13.46%。同 seed 的 baseline 是 41.61%、41.81%、41.08%（seed 0 在 `runs/diag/mbv2_default_init/`，seed 1、2 在 `runs/sort_ablation_baseline.jsonl`）。`all` 在每個 seed 都比 `none` 高（+3.41、+5.06、+12.87 個百分點），但信賴區間跨過 0，判讀為無法判定。對 baseline，`none` 是 −15.49 [−43.70, +12.72]，`all` 是 −8.38 [−24.60, +7.84]，3 個 seed 都是負的；匯出的 ×3 模型（372 萬個參數）最高也只有 34.21%。
+1. **MobileNetV2 上，NetAug 的結果在 seed 之間差很多；這 3 個 seed 中，排序都減少了損失。** 不排序時是 36.50%、28.06%、13.46%。同 seed 的 baseline 是 41.61%、41.81%、41.08%（seed 0 在 `runs/diag/mbv2_default_init/`，seed 1、2 在 `runs/sort_ablation_baseline.jsonl`）。`all` 在每個 seed 都比 `none` 高（+3.41、+5.06、+12.87 個百分點），但信賴區間跨過 0，判讀為無法判定。對 baseline，`none` 是 −15.49 [−43.70, +12.72]，`all` 是 −8.38 [−24.60, +7.84]，3 個 seed 都是負的；匯出的 ×3 模型（372 萬個參數）各設定的 3 個 seed 平均最高也只有 34.21%。
 2. **MobileNetV2 上，官方實作的排序範圍（`inner`）比 `all` 差**：−2.34 [−4.43, −0.25]，3 個 seed 都是負的（−1.96、−3.30、−1.75）。這是對 `all` 的 13 個比較之一，沒有做多重比較校正。`closed` 對 `all` 是 +0.06 [−5.20, +5.32]，判讀為無法判定。
 3. **TinyResNet 上，排序沒有實質增益**：`all` 對 `none` 是 −0.09 [−0.60, +0.42]，`inner` 對 `none` 是 −0.15 [−0.55, +0.24]，上限都小於 +0.5。其他設定對 `none` 都是無法判定。
 4. **重要度的合計方式與 optimizer 狀態的處理，只有 `all-mean`（MobileNetV2）可以判讀。** 它幾乎選出和 `all` 相同的排列（每次排序平均 0.1 個群組不同），差異 −0.02 [−0.08, +0.03]，沒有實質差異。其他設定都是無法判定（信賴區間寬 2.9 到 8.9 個百分點）。TinyResNet 上 `all-mean`、`all-keep`、`all-rebuild` 在 3 個 seed 都低於 `all`；`all-keep` 與 `all-rebuild` 匯出的各寬度也低 1.0 到 1.4 個百分點。
-5. **排序保持函數不變。** 最大寬度輸出的最大變化相對於最大 logit：TinyResNet 在 6.7e-7 以內，MobileNetV2 在 7.3e-4 以內（7.9e-3 對 logit 10.8）。MobileNetV2 的值較大，所以另外用 float64 重算：重跑 10 epoch（`all-single`、seed 2），每次排序前後的輸出差異在 float64 下是 7.4e-14 以內，同一次排序在 float32 下是 2e-6 到 1.4e-4。所以這是 float32 的捨入誤差被網路放大，不是排序改變了函數。移入 base 的通道數差很多：TinyResNet 每個執行的 39 次排序合計 0 到 2 個（與第 3.2、4.5 節一致），MobileNetV2 是 931 到 4,500 個。這可能是只有 MobileNetV2 的結果隨排序明顯變化的原因（未證實）。
+5. **排序保持函數不變。** 最大寬度輸出的最大變化相對於最大 logit：TinyResNet 在 6.7e-7 以內，MobileNetV2 在 7.3e-4 以內（7.9e-3 對 logit 10.8）。MobileNetV2 的值較大，所以另外用 float64 重算（`runs/diag/sort_fp64/`）：重跑 10 epoch（`all-single`、seed 2），每次排序前後的輸出差異在 float64 下是 7.4e-14 以內，同一次排序在 float32 下是 2e-6 到 1.4e-4。所以這是 float32 的捨入誤差被網路放大，不是排序改變了函數。移入 base 的通道數差很多：TinyResNet 每個執行的 39 次排序合計 0 到 2 個（與第 3.2、4.5 節一致），MobileNetV2 是 931 到 4,500 個。這可能是只有 MobileNetV2 的結果隨排序明顯變化的原因（未證實）。
 
 ### 4.8 可能的原因（未證實）
 
