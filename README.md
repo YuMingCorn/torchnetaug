@@ -223,6 +223,17 @@ ema = copy.deepcopy(model)
 perms = model.sort_channels(optimizer=optimizer, extra_models=[ema])   # {群組編號: 排列}
 ```
 
+`scope=` 選擇要排序的群組：`"all"`（預設）、`"inner"`（只排 block 內的群組，對應官方實作的範圍）、`"closed"`，或群組編號的集合。`group_kinds()` 回傳每個群組的類別與所在的 block。類別與 block 的判定見 [design.md 第 5.2 節](docs/design.md#52-群組類別與排序範圍)，和官方實作的逐項對照見 [official_diff.md](docs/official_diff.md)。
+
+```python
+from collections import Counter
+
+kinds = model.group_kinds()                     # {群組編號: GroupInfo}
+print(Counter(info.kind for info in kinds.values()))
+perms = model.sort_channels(optimizer=optimizer, extra_models=[ema], scope="inner")
+assert set(perms) == {g for g, info in kinds.items() if info.kind == "inner"}
+```
+
 ### `recalibrate_bn`
 
 預設在 base 模式下重新估計所有 BN 的 running 統計值，結束後還原寬度與深度。批次可以是 `(inputs, targets)` 或單一張量，其他格式用 `forward=`。建議使用關掉資料增強的訓練資料。
@@ -309,7 +320,7 @@ print(wrapped.max_sizes)   # [3, 16, 32, 10]
 uv run pytest
 ```
 
-471 個測試以普通 PyTorch 模型為基準，檢查 base 模式、每個寬度、一步的梯度（論文 Eq. 2）、排序與匯出。見 [design.md 第 9 節](docs/design.md#9-正確性驗證)。
+609 個測試以普通 PyTorch 模型為基準，檢查 base 模式、每個寬度、一步的梯度（論文 Eq. 2）、排序與匯出。見 [design.md 第 9 節](docs/design.md#9-正確性驗證)。
 
 ## 引用與參考資料
 

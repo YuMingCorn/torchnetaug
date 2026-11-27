@@ -107,6 +107,9 @@ def label_of(r: dict) -> str:
     if mults != [1.0, 2.0, 3.0] and not (r.get("depth") and mults == [1.0]):
         label += " x(" + "/".join(f"{m:g}" for m in mults) + ")"
     label += f"+sort{r['sort_every']}" if r["sort_every"] else ""
+    for field, default in (("sort_scope", "all"), ("sort_agg", "sum"), ("sort_opt", "permute")):
+        if r.get(field, default) != default:
+            label += f" {field.removeprefix('sort_')}-{r[field]}"
     if r.get("alpha", 1.0) != 1.0:
         label += f" alpha{r['alpha']:g}"
     if r.get("stop_aug", 0.0):

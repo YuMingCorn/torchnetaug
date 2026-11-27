@@ -75,7 +75,10 @@ def test_sort_keeps_max_function(model_name, train_mode):
     assert any(not torch.equal(p, torch.arange(p.numel())) for p in perms.values())
     aug.set_max()
     torch.manual_seed(0)
-    torch.testing.assert_close(aug(x), before, atol=1e-8, rtol=1e-8)
+    # train-mode batch norm over a 2-image batch amplifies float64 rounding (it depends on
+    # the summation order, so on the thread count): about 2e-8 for efficientnet_b0
+    tol = 1e-7 if train_mode else 1e-8
+    torch.testing.assert_close(aug(x), before, atol=tol, rtol=tol)
 
 
 def test_sort_orders_importance(model_name):

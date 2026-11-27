@@ -5,7 +5,7 @@ Learning". ICLR 2022. https://arxiv.org/abs/2110.08890
 """
 
 from .depth import DepthStack
-from .graph import ChannelGraph, LayerRole, TraceError, analyze, check_plain
+from .graph import ChannelGraph, GroupInfo, LayerRole, TraceError, analyze, check_plain
 from .layers import DynamicBatchNorm, DynamicConv2d, DynamicLinear, DynamicModule
 from .netaug import NetAugModel
 from .train import netaug_step, recalibrate_bn
@@ -17,6 +17,7 @@ __all__ = [
     "DynamicConv2d",
     "DynamicLinear",
     "DynamicModule",
+    "GroupInfo",
     "LayerRole",
     "NetAugModel",
     "TraceError",

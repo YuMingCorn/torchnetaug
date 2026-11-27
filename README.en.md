@@ -223,6 +223,17 @@ ema = copy.deepcopy(model)
 perms = model.sort_channels(optimizer=optimizer, extra_models=[ema])   # {group index: permutation}
 ```
 
+`scope=` chooses the groups to sort: `"all"` (default), `"inner"` (only groups inside a block, the scope of the official implementation), `"closed"`, or a collection of group indices. `group_kinds()` returns the kind of each group and the block that holds it. For how kinds and blocks are found, see [design.en.md Section 5.2](docs/design.en.md#52-group-kinds-and-sort-scope). For an item-by-item comparison with the official implementation, see [official_diff.en.md](docs/official_diff.en.md).
+
+```python
+from collections import Counter
+
+kinds = model.group_kinds()                     # {group index: GroupInfo}
+print(Counter(info.kind for info in kinds.values()))
+perms = model.sort_channels(optimizer=optimizer, extra_models=[ema], scope="inner")
+assert set(perms) == {g for g, info in kinds.items() if info.kind == "inner"}
+```
+
 ### `recalibrate_bn`
 
 By default, it re-estimates the running statistics of all BN layers in base mode. Then it restores the width and depth. A batch can be `(inputs, targets)` or a single tensor. For other formats, use `forward=`. Use training data with data augmentation turned off.
@@ -309,7 +320,7 @@ print(wrapped.max_sizes)   # [3, 16, 32, 10]
 uv run pytest
 ```
 
-The 471 tests compare against plain PyTorch models. They check base mode, every width, the gradient of one step (Eq. 2 of the paper), sorting and export. See [design.en.md Section 9](docs/design.en.md#9-correctness-verification).
+The 609 tests compare against plain PyTorch models. They check base mode, every width, the gradient of one step (Eq. 2 of the paper), sorting and export. See [design.en.md Section 9](docs/design.en.md#9-correctness-verification).
 
 ## Citation and references
 
